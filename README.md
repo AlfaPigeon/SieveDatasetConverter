@@ -1,4 +1,4 @@
-# Sieve DatasetConverter
+# Sieve Dataset Converter
 
 Pull a dataset from Hugging Face or a Parquet, CSV, JSON, JSONL or DuckDB file, map it onto a schema you define, sample N rows and write them to a DuckDB file. It comes as a one-page web UI and an MCP server, so AI agents can run the same pipeline.
 
