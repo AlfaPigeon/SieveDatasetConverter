@@ -1,0 +1,8 @@
+node_modules/
+data/
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.csv
+*.jsonl
+.env

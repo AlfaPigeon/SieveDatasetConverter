@@ -1,0 +1,29 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sieve DatasetConverter</title><link rel="stylesheet" href="style.css"></head>
+<body><main>
+<header><h1>Sieve <span>DatasetConverter</span></h1><p>Hugging Face or file URL → schema → DuckDB</p></header>
+
+<section id="s1"><h2><b>1</b> Dataset</h2>
+  <div class="row"><input id="url" class="grow" placeholder="org/name, a Hugging Face URL, or a .csv / .json / .jsonl / .parquet URL">
+  <input id="config" placeholder="config" size="9"><input id="split" placeholder="split" size="7"></div>
+  <div class="row"><label>Schema <select id="schema"></select></label><button class="ghost" onclick="toggleEditor()">Edit schemas</button>
+  <span class="grow"></span><button onclick="imp()">Download</button></div>
+  <div id="editor" hidden><textarea id="schemaJson" rows="14" spellcheck="false"></textarea>
+  <div class="row"><span class="hint">Save under a new <code>name</code> to create a schema.</span><span class="grow"></span><button onclick="saveSchema()">Save schema</button></div></div>
+  <p id="info" class="hint"></p></section>
+
+<section id="s2" class="off"><h2><b>2</b> Mapping</h2><div id="map" class="grid"></div></section>
+
+<section id="s3" class="off"><h2><b>3</b> Metadata</h2><div class="grid">
+  <label>Name<input id="name"></label><label>Domain<input id="domain"></label>
+  <label>Source<input id="source"></label><label>Notes<input id="notes"></label></div>
+  <div class="row"><span class="grow"></span><button class="ghost" onclick="prev()">Preview</button></div></section>
+
+<section id="s4" class="off"><h2><b>4</b> Sample &amp; write</h2>
+  <div class="row"><label>Rows<input id="n" type="number" value="500" min="1" size="6"></label><label>Seed<input id="seed" type="number" value="42" size="5"></label>
+  <label class="grow">Target<input id="target" list="targets" placeholder="datasets.duckdb"></label><datalist id="targets"></datalist>
+  <label>Mode<select id="mode"><option value="append">append</option><option value="create">create new</option></select></label>
+  <button onclick="write_()">Write</button></div></section>
+
+<pre id="out"></pre></main>
+<script src="app.js"></script></body></html>

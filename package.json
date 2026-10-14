@@ -1,0 +1,21 @@
+{
+  "name": "sieve-dataset-converter",
+  "version": "0.1.0",
+  "description": "Sieve DatasetConverter: Hugging Face / CSV / JSON / Parquet datasets -> configurable schema -> DuckDB. Web UI + MCP server.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "mcp:stdio": "node src/stdio.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.6-r.1",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "express": "^5.3.0",
+    "zod": "^4.6.7"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
+}

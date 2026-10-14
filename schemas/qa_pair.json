@@ -1,0 +1,33 @@
+{
+  "name": "qa_pair",
+  "description": "Plain question/answer",
+  "fields": [
+    {
+      "name": "question",
+      "type": "text",
+      "required": true,
+      "max_chars": 300,
+      "aliases": [
+        "question"
+      ],
+      "transform": "copy"
+    },
+    {
+      "name": "answer",
+      "type": "text",
+      "max_chars": 100,
+      "aliases": [
+        "answer",
+        "answerkey"
+      ],
+      "transform": "copy"
+    },
+    {
+      "name": "domain",
+      "type": "text",
+      "transform": "metadata",
+      "value": "domain"
+    }
+  ],
+  "table": "qa_pair"
+}
