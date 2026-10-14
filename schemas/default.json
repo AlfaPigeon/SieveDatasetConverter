@@ -1,16 +1,87 @@
 {
   "name": "default",
-  "description": "Decision rows: a text input, optional answer options, a label and/or a numeric score, typed as choice | noul | score.",
+  "description": "Decision rows: a text input, optional answer options, a label and/or a numeric score, typed as choice | noul | score. Per-row metadata goes to the JSON column `meta`.",
   "table": "rows",
   "fields": [
-    { "name": "domain", "type": "text", "transform": "metadata", "value": "domain" },
-    { "name": "decision_type", "type": "text", "transform": "constant", "value": "choice", "enum": ["choice", "noul", "score"] },
-    { "name": "input", "type": "text", "required": true, "transform": "join", "max_chars": 4000,
-      "aliases": ["question", "prompt", "input", "text", "sentence", "context", "query", "instruction", "premise"] },
-    { "name": "options", "type": "list", "max_items": 16, "item_max_chars": 200,
-      "aliases": ["choices", "options", "candidates", "endings"] },
-    { "name": "label", "type": "text", "transform": "label_to_option", "option_field": "options", "max_chars": 500,
-      "aliases": ["answer", "answerkey", "label", "target", "output", "correct", "response", "class", "species"] },
-    { "name": "score", "type": "number", "aliases": ["score", "rating", "stars", "confidence"] }
+    {
+      "name": "domain",
+      "type": "text",
+      "transform": "metadata",
+      "value": "domain"
+    },
+    {
+      "name": "decision_type",
+      "type": "text",
+      "transform": "constant",
+      "value": "choice",
+      "enum": [
+        "choice",
+        "noul",
+        "score"
+      ]
+    },
+    {
+      "name": "input",
+      "type": "text",
+      "required": true,
+      "transform": "join",
+      "max_chars": 4000,
+      "aliases": [
+        "question",
+        "prompt",
+        "input",
+        "text",
+        "sentence",
+        "context",
+        "query",
+        "instruction",
+        "premise"
+      ]
+    },
+    {
+      "name": "options",
+      "type": "list",
+      "max_items": 16,
+      "item_max_chars": 200,
+      "aliases": [
+        "choices",
+        "options",
+        "candidates",
+        "endings"
+      ]
+    },
+    {
+      "name": "label",
+      "type": "text",
+      "transform": "label_to_option",
+      "option_field": "options",
+      "max_chars": 500,
+      "aliases": [
+        "answer",
+        "answerkey",
+        "label",
+        "target",
+        "output",
+        "correct",
+        "response",
+        "class",
+        "species"
+      ]
+    },
+    {
+      "name": "score",
+      "type": "number",
+      "aliases": [
+        "score",
+        "rating",
+        "stars",
+        "confidence"
+      ]
+    },
+    {
+      "name": "meta",
+      "type": "json",
+      "transform": "meta"
+    }
   ]
 }

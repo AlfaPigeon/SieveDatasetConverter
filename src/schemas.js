@@ -1,12 +1,14 @@
 // Schema store: JSON files in ./schemas (override with SCHEMAS_DIR).
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const DIR = path.resolve(process.env.SCHEMAS_DIR || 'schemas');
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const DIR = path.resolve(ROOT, process.env.SCHEMAS_DIR || 'schemas');
 fs.mkdirSync(DIR, { recursive: true });
 
 export const FIELD_TYPES = ['text', 'number', 'integer', 'boolean', 'list', 'json'];
-export const TRANSFORMS = ['copy', 'join', 'first', 'constant', 'metadata', 'label_to_option'];
+export const TRANSFORMS = ['copy', 'join', 'first', 'constant', 'metadata', 'meta', 'label_to_option'];
 const NAME = /^[a-z][a-z0-9_]{0,62}$/;
 const RESERVED = ['id', 'dataset_id', 'source_row', 'created_at'];
 
