@@ -4,70 +4,75 @@ import * as core from './core.js';
 import * as schemas from './schemas.js';
 
 const ok = (x) => ({ content: [{ type: 'text', text: JSON.stringify(x, null, 2) }] });
-const wrap = (fn) => async (a) => { try { return ok(await fn(a)); } catch (e) { return { isError: true, content: [{ type: 'text', text: String(e.message || e) }] }; } };
-const metaList = z.array(z.object({ key: z.string(), value: z.any().optional(), column: z.string().optional() }));
+// Optional params also accept null (= not given); target_column keeps null (= disable).
+const dropNulls = (a) => Object.fromEntries(Object.entries(a || {}).filter(([k, v]) => v !== null || k === 'target_column'));
+const wrap = (fn) => async (a) => { try { return ok(await fn(dropNulls(a))); } catch (e) { return { isError: true, content: [{ type: 'text', text: String(e.message || e) }] }; } };
+const nullable = (shape) => Object.fromEntries(Object.entries(shape).map(([k, s]) => [k, s.safeParse(undefined).success ? s.nullable() : s]));
+
+const metaList = z.array(z.object({ key: z.string(), value: z.any().optional(), column: z.string().nullish() }));
+const metaAny = metaList.or(z.record(z.string(), z.any()));
 const metadata = metaList.optional()
   .describe('replaces the metadata list; each entry is a constant {key, value} (JSON types kept; numeric/boolean/JSON strings are parsed) or {key, column} copied per row from a source column, nested path (a.b[0].c) or "source_row"');
 const target_column = z.string().nullable().optional().describe('schema field (json/text) that stores the per-row metadata object; null to disable');
 const mapping = z.record(z.string(), z.union([z.array(z.string()), z.string(), z.null()])).optional()
   .describe('schema field -> source column(s) or nested paths like "a.b[0].c" / "completions[*].overall_score". Omit to auto-suggest from column names.');
 const overrides = z.record(z.string(), z.any()).optional().describe('schema field -> constant value for every row');
+const field_options = z.record(z.string(), z.record(z.string(), z.any()).nullable()).optional()
+  .describe('per-dataset changes to schema field properties, e.g. {"label": {"label_mode": "index"}, "options": {"gold_from": {"column": "labels", "map": {"1": 0, "0": 1}}}}');
 const target = z.string().default('datasets.duckdb').describe('DuckDB file: bare name (inside the data dir) or path');
 const mode = z.enum(['create', 'append']);
+const where = z.string().optional().describe('DuckDB row filter over source columns, e.g. "label >= 0 AND length(text) < 2000"');
 const write = {
-  where: z.string().optional().describe('DuckDB row filter over source columns, e.g. "label >= 0 AND length(text) < 2000"'),
+  where,
   write_key: z.string().optional().describe('rows are replaced per (dataset_id, write_key), so one import can be written several times under different keys/tags'),
-  splits: z.array(z.object({ tag: z.string(), n: z.number().int(), metadata: metaList.or(z.record(z.string(), z.any())).optional(), overrides: z.record(z.string(), z.any()).optional() })).optional()
-    .describe('cut one shuffled sample into disjoint parts; each part is written with write_key = tag (sample is ignored)'),
+  splits: z.array(z.object({ tag: z.string(), n: z.number().int(), metadata: metaAny.nullish(), overrides: z.record(z.string(), z.any()).nullish(), mapping: mapping.nullable(), field_options: field_options.nullable() })).optional()
+    .describe('cut one shuffled sample into disjoint parts; each part is written with write_key = tag (sample is ignored) and may change metadata, overrides, mapping and field_options'),
   exclude_dataset_ids: z.array(z.string()).optional().describe('skip source rows already written to the target by these dataset_ids'),
   exclude_same_source: z.boolean().optional().describe('skip source rows already written to the target from the same source (same HF repo/config/split or file)'),
 };
 const cleanup = z.boolean().default(false).describe("after a successful write, delete this dataset's downloaded files in data/downloads");
-const limit = z.union([z.number().int(), z.literal('all')]).optional()
-  .describe('max rows to fetch (default 10000; "all" for everything). Hugging Face: reads only the first N rows remotely (DuckDB httpfs range reads, /rows API fallback for <= 1000), so a limit is the first N rows of the split, not a random subset; "all" downloads whole shards');
+const fetchParams = {
+  limit: z.union([z.number().int(), z.literal('all')]).optional()
+    .describe('max rows to fetch (default 10000; "all" downloads whole shards). Hugging Face with a limit reads only the needed row groups and columns remotely'),
+  fetch: z.enum(['random', 'head']).optional().describe('HF partial fetch: "random" (default) = seeded random row groups across shards; "head" = the first N rows'),
+  columns: z.array(z.string()).optional().describe('HF partial fetch: only read these columns (default: the columns used by mapping/metadata/where when a mapping is given, else all)'),
+};
 
-const FIELD_DOC = `Schema JSON: {name, table?, description?, fields:[{name, type: ${schemas.FIELD_TYPES.join('|')}, transform?: ${schemas.TRANSFORMS.join('|')}, required?, max_chars?, max_items?, item_max_chars?, aliases?:[column names for auto-mapping], value? (constant value, or metadata key for transform=metadata; transform=meta marks the default per-row metadata column), option_field? (options field for label_to_option | label_to_distribution | options_dict), label_field? (label_to_distribution without own columns reads this field's source; default: the label_to_option field), ids?: text|index (option ids for label_to_distribution/options_dict; default text), gold_field? (shuffle: field that receives the gold index), enum?, default?}]}. Transforms: label_to_distribution -> {probabilities:{id:p}} (one-hot from a label/index/letter/ClassLabel, uniform over a multi-label list, soft from a numeric value, or normalised over several numeric columns); options_dict -> {id: option}; shuffle -> seeded shuffle of the mapped columns/list where the first is the gold one, gold index goes to gold_field (or meta.gold_index). Columns id, dataset_id, source_row, created_at are added automatically.`;
+const FIELD_DOC = `Schema JSON: {name, table?, description?, fields:[{name, type: ${schemas.FIELD_TYPES.join('|')}, transform?: ${schemas.TRANSFORMS.join('|')}, required?, max_chars?, max_items?, item_max_chars?, aliases?:[column names for auto-mapping], value? (constant value, or metadata key for transform=metadata; transform=meta marks the default per-row metadata column), option_field? (options field for label_to_option | label_to_distribution | options_dict), label_field? (label_to_distribution without own columns reads this field's source; default: the label_to_option field), label_mode?: auto|text|index|numeric (how a label matches options; auto = text, then numeric value if all options are numbers, else index/letter), ids?: text|index (option ids; default the option text, duplicates get "#2", "#3"), as? (options_dict: list [{id,text}] (default) | object {id:text}; label_to_distribution: object {id:p} (default) | list [{id,p}]), gold_field? and gold_from? {column, map?} (shuffle), enum?, default?}]}. Options may also be given with explicit ids: [{id, text}] or {id: text}. Transforms: label_to_distribution -> {probabilities} (one-hot from a label, uniform over a multi-label list, soft from a numeric value in auto/numeric mode, or normalised over several numeric columns; sums to 1); a label_to_option field that is empty or not an option gets the distribution's argmax option; options_dict -> ordered [{id, text}]; shuffle -> seeded shuffle of the mapped columns/list; gold = gold_from (column value, optionally mapped to an item index or column name) or the first item; its index after shuffling goes to gold_field (or meta.gold_index). Columns id, dataset_id, write_key, source_row, created_at are added automatically.`;
 
 export function buildMcpServer() {
   const s = new McpServer({ name: 'sieve-dataset-converter', version: '0.1.0' });
-  s.registerTool('list_schemas', { description: 'List available output schemas.', inputSchema: {} }, wrap(() => schemas.listSchemas()));
-  s.registerTool('get_schema', { description: 'Get one schema definition.', inputSchema: { name: z.string() } }, wrap(({ name }) => schemas.getSchema(name)));
-  s.registerTool('save_schema', { description: `Create or overwrite a schema. ${FIELD_DOC}`, inputSchema: { schema: z.record(z.string(), z.any()) } },
-    wrap(({ schema }) => schemas.saveSchema(schema)));
-  s.registerTool('list_targets', { description: 'List .duckdb target files in the data dir.', inputSchema: {} }, wrap(() => core.listTargets()));
-  s.registerTool('hf_splits', { description: 'List configs and splits (with row counts) of a Hugging Face dataset.', inputSchema: { dataset: z.string() } },
-    wrap(({ dataset }) => core.hfSplits(dataset)));
-  s.registerTool('import_dataset', {
-    description: 'Download a dataset: Hugging Face name (org/name) or URL, or a CSV/JSON/JSONL/Parquet/DuckDB URL or local path. Returns dataset_id, columns, row count and an auto-suggested mapping for the chosen schema.',
-    inputSchema: { url: z.string(), schema: z.string().default('default'), config: z.string().optional(), split: z.string().optional(), format: z.enum(['csv', 'json', 'jsonl', 'parquet', 'duckdb']).optional(), table: z.string().optional().describe('table to read from a .duckdb source (default: first; see tables in the result)'), limit },
-  }, wrap(({ url, ...o }) => core.importDataset(url, o)));
-  s.registerTool('preview', {
-    description: 'Show raw rows and how they convert with the current schema and mapping.',
-    inputSchema: { dataset_id: z.string(), n: z.number().int().optional(), where: write.where },
-  }, wrap(({ dataset_id, n, where }) => core.preview(dataset_id, n, where)));
-  s.registerTool('set_metadata', {
-    description: 'Set the metadata list and the column it is stored in, switch schema or DuckDB source table, or change the field mapping / constant overrides.',
-    inputSchema: { dataset_id: z.string(), metadata, target_column, schema: z.string().optional(), table: z.string().optional().describe('switch table for .duckdb sources'), mapping, overrides },
-  }, wrap(({ dataset_id, metadata, target_column, schema, table, mapping, overrides }) => core.setMetadata(dataset_id, metadata, { schema, table, mapping, overrides, target_column })));
-  s.registerTool('convert_and_write', {
-    description: 'Seeded sample of N rows (default 500), convert, and write into the target DuckDB (schema table + datasets metadata table). mode=create makes a new file, mode=append adds to an existing one. Re-writing the same dataset_id + write_key replaces its rows.',
-    inputSchema: { dataset_id: z.string(), sample: z.number().int().default(500), target, mode: mode.default('append'), seed: z.number().int().default(42), cleanup, ...write,
-      metadata: metaList.or(z.record(z.string(), z.any())).optional().describe('metadata for this write only, merged by key onto the dataset metadata (set_metadata is unchanged)'),
-      overrides: z.record(z.string(), z.any()).optional().describe('field -> constant for this write only') },
-  }, wrap(({ dataset_id, ...o }) => core.convertAndWrite(dataset_id, o)));
-  s.registerTool('run_pipeline', {
-    description: 'One shot: Hugging Face name (+ optional config/split) and schema -> download, auto-map, sample, write. mode defaults to append if the target exists, else create.',
-    inputSchema: { url: z.string(), schema: z.string().default('default'), config: z.string().optional(), split: z.string().optional(), table: z.string().optional(), limit,
-      metadata, target_column, mapping, overrides, sample: z.number().int().default(500), seed: z.number().int().default(42), target, mode: mode.optional(), cleanup, ...write },
-  }, wrap((a) => core.runPipeline(a)));
-  s.registerTool('delete_dataset', {
-    description: 'Delete a dataset_id\'s rows (all write_keys, or only write_key) and its records in the datasets table of a target file.',
-    inputSchema: { dataset_id: z.string(), target, write_key: z.string().optional() },
-  }, wrap(({ dataset_id, ...o }) => core.deleteDataset(dataset_id, o)));
-  s.registerTool('cleanup_downloads', {
-    description: 'Delete downloaded source files in data/downloads: one dataset_id, or all when omitted. Returns files deleted and bytes freed.',
-    inputSchema: { dataset_id: z.string().optional() },
-  }, wrap(({ dataset_id }) => core.cleanupDownloads(dataset_id)));
-  s.registerTool('list_datasets', { description: 'List datasets imported in this process.', inputSchema: {} }, wrap(() => core.listDatasets()));
+  const tool = (name, description, shape, fn) => s.registerTool(name, { description, inputSchema: nullable(shape) }, wrap(fn));
+  tool('list_schemas', 'List available output schemas.', {}, () => schemas.listSchemas());
+  tool('get_schema', 'Get one schema definition.', { name: z.string() }, ({ name }) => schemas.getSchema(name));
+  tool('save_schema', `Create or overwrite a schema. ${FIELD_DOC}`, { schema: z.record(z.string(), z.any()) }, ({ schema }) => schemas.saveSchema(schema));
+  tool('list_targets', 'List .duckdb target files in the data dir.', {}, () => core.listTargets());
+  tool('hf_splits', 'List configs and splits (with row counts) of a Hugging Face dataset.', { dataset: z.string() }, ({ dataset }) => core.hfSplits(dataset));
+  tool('import_dataset', 'Fetch a dataset: Hugging Face name (org/name) or URL; a CSV/JSON/JSONL/Parquet/DuckDB URL or local path; a glob of local files; or the dataset_id of an earlier HF import (re-reads its files in data/downloads, keeping the HF origin). Returns dataset_id, columns, row count and an auto-suggested mapping for the chosen schema.',
+    { url: z.string(), schema: z.string().default('default'), config: z.string().optional(), split: z.string().optional(), format: z.enum(['csv', 'json', 'jsonl', 'parquet', 'duckdb']).optional(),
+      table: z.string().optional().describe('table to read from a .duckdb source (default: first; see tables in the result)'), ...fetchParams,
+      seed: z.number().int().optional().describe('seed for fetch="random" (default 42)'), mapping: mapping.describe('optional mapping, applied after import and used to pick columns to fetch') },
+    ({ url, ...o }) => core.importDataset(url, o));
+  tool('preview', 'Show raw rows and how they convert with the current schema and mapping.', { dataset_id: z.string(), n: z.number().int().optional(), where },
+    ({ dataset_id, n, where: w }) => core.preview(dataset_id, n, w));
+  tool('set_metadata', 'Set the metadata list and the column it is stored in, switch schema or DuckDB source table, or change the field mapping, constant overrides or field options.',
+    { dataset_id: z.string(), metadata, target_column, schema: z.string().optional(), table: z.string().optional().describe('switch table for .duckdb sources'), mapping, overrides, field_options },
+    ({ dataset_id, metadata: m, ...o }) => core.setMetadata(dataset_id, m, o));
+  tool('convert_and_write', 'Seeded sample of N rows (default 500), convert, and write into the target DuckDB (schema table + datasets metadata table). mode=create makes a new file, mode=append adds to an existing one. Re-writing the same dataset_id + write_key replaces its rows.',
+    { dataset_id: z.string(), sample: z.number().int().default(500), target, mode: mode.default('append'), seed: z.number().int().default(42), cleanup, ...write,
+      metadata: metaAny.optional().describe('metadata for this write only, merged by key onto the dataset metadata (set_metadata is unchanged)'),
+      overrides: z.record(z.string(), z.any()).optional().describe('field -> constant for this write only'),
+      mapping: mapping.describe('mapping changes for this write only'), field_options: field_options.describe('field option changes for this write only') },
+    ({ dataset_id, ...o }) => core.convertAndWrite(dataset_id, o));
+  tool('run_pipeline', 'One shot: Hugging Face name (+ optional config/split) and schema -> fetch, map, sample, write. With a mapping, only the columns it uses are fetched. mode defaults to append if the target exists, else create.',
+    { url: z.string(), schema: z.string().default('default'), config: z.string().optional(), split: z.string().optional(), table: z.string().optional(), ...fetchParams,
+      fetch_seed: z.number().int().optional().describe('seed for fetch="random" (default 42)'),
+      metadata, target_column, mapping, overrides, field_options, sample: z.number().int().default(500), seed: z.number().int().default(42), target, mode: mode.optional(), cleanup, ...write },
+    (a) => core.runPipeline(a));
+  tool('delete_dataset', "Delete a dataset_id's rows (all write_keys, or only write_key) and its records in the datasets table of a target file.",
+    { dataset_id: z.string(), target, write_key: z.string().optional() }, ({ dataset_id, ...o }) => core.deleteDataset(dataset_id, o));
+  tool('cleanup_downloads', 'Delete downloaded source files in data/downloads: one dataset_id, or all when omitted. Returns files deleted and bytes freed.',
+    { dataset_id: z.string().optional() }, ({ dataset_id }) => core.cleanupDownloads(dataset_id));
+  tool('list_datasets', 'List datasets imported in this process.', {}, () => core.listDatasets());
   return s;
 }

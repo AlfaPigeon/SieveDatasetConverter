@@ -54,5 +54,29 @@ assert.equal((await core.cleanupDownloads()).files_deleted, 0); // nothing downl
 await assert.rejects(core.preview(d.dataset_id, 1, 'x; DROP TABLE y'), /where/);
 await assert.rejects(core.preview(d.dataset_id, 1, "(SELECT 1) = 1"), /where/);
 
+// option ids: duplicates get '#2', explicit ids, label modes, argmax label for soft targets, re-import by id
+const src3 = path.join(dir, 'src3.jsonl');
+fs.writeFileSync(src3, [
+  { q: 'a', opts: ['yes', 'no', 'yes'], ans: 'no', stars: 2 },
+  { q: 'b', opts: ['1', '2', '3'], ans: 2, stars: 2 },
+  { q: 'c', opts: ['x', 'y'], ans: null, soft: 0.8, stars: 1 },
+].map((x) => JSON.stringify(x)).join('\n'));
+const d3 = await core.importDataset(src3, { limit: 'all', mapping: { input: ['q'], options: ['opts'], label: ['ans'] } });
+const rows3 = async () => (await core.preview(d3.dataset_id, 3)).converted.sort((a, b) => a.source_row - b.source_row);
+let c3 = await rows3();
+assert.deepEqual(Object.keys(c3[0].target.probabilities), ['yes', 'no', 'yes#2']);
+assert.equal(Object.values(c3[0].target.probabilities).reduce((a, b) => a + b, 0), 1);
+assert.equal(c3[1].label, '2'); // numeric options: auto mode matches the value, no index fallback
+await core.setMetadata(d3.dataset_id, {}, { field_options: { label: { label_mode: 'index' } } });
+assert.equal((await rows3())[1].label, '3');
+await core.setMetadata(d3.dataset_id, {}, { mapping: { target: ['soft'] }, field_options: { label: { label_mode: 'auto' } } });
+c3 = await rows3();
+assert.deepEqual(c3[2].target, { probabilities: { x: 0.2, y: 0.8 } });
+assert.equal(c3[2].label, 'y'); // label missing -> argmax option of the distribution
+fs.writeFileSync(src3, JSON.stringify({ q: 'd', opts: { true: 'Yes', false: 'No' }, ans: 'true' }));
+const d4 = await core.importDataset(src3, { limit: 'all', mapping: { input: ['q'], options: ['opts'], label: ['ans'] } });
+const c4 = (await core.preview(d4.dataset_id, 1)).converted[0]; // explicit ids {id: text}
+assert.equal(c4.label, 'Yes'); assert.deepEqual(c4.target, { probabilities: { true: 1, false: 0 } });
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log('smoke test passed');

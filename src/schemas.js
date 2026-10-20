@@ -37,6 +37,9 @@ export function validateSchema(s) {
     if (f.label_field && !has(f.label_field)) throw new Error(`field ${f.name}: label_field "${f.label_field}" not found`);
     if (f.gold_field && !has(f.gold_field)) throw new Error(`field ${f.name}: gold_field "${f.gold_field}" not found`);
     if (f.ids && !['text', 'index'].includes(f.ids)) throw new Error(`field ${f.name}: ids must be text or index`);
+    if (f.label_mode && !['auto', 'text', 'index', 'numeric'].includes(f.label_mode)) throw new Error(`field ${f.name}: label_mode must be auto, text, index or numeric`);
+    if (f.as && !['object', 'list'].includes(f.as)) throw new Error(`field ${f.name}: as must be object or list`);
+    if (f.gold_from && !f.gold_from.column) throw new Error(`field ${f.name}: gold_from needs a column`);
   }
   return s;
 }
