@@ -53,7 +53,7 @@ function hfError(repo, status, msg = '') {
   if (/script|arbitrary python/i.test(msg))
     return e('script', `${repo} is built by a loading script and has no Parquet export (refs/convert/parquet), so Sieve can't read it. Point Sieve at the dataset's data files by URL instead.`);
   if (status === 401 || status === 403 || /gated|restricted|without authentication/i.test(msg))
-    return e('gated', `${repo} is gated, private or doesn't exist (HTTP ${status}). If it is gated, request access on https://huggingface.co/datasets/${repo} with the account whose HF_TOKEN Sieve uses${process.env.HF_TOKEN ? '' : ' (HF_TOKEN is not set)'}.`);
+    return e('gated', `${repo} is gated or private and HF_TOKEN has no access (HTTP ${status}). If it is gated, request access on https://huggingface.co/datasets/${repo} with the account whose HF_TOKEN Sieve uses${process.env.HF_TOKEN ? '' : ' (HF_TOKEN is not set)'}.`);
   return e('other', `Hugging Face (${repo}): ${String(msg || `HTTP ${status}`).slice(0, 200)}`);
 }
 async function hfFetch(repo, url) {
@@ -75,7 +75,17 @@ export async function hfSplits(name) {
 }
 // Parquet shards for one config/split (default: a config that has a train split).
 // datasets-server first; if that fails, list the Hub's refs/convert/parquet branch directly.
+// HF auth-check first: a gated repo without access fails here the same way whatever config/split was asked
+// (the datasets-server answers 404 for some and file reads 403 for others).
+async function hfAccess(repo) {
+  let r; try { r = await fetch(`https://huggingface.co/api/datasets/${repo}/auth-check`, { headers: hfHeaders() }); } catch { return; }
+  if (r.ok) return;
+  const t = await r.text().catch(() => ''); let m = t; try { m = JSON.parse(t).error || t; } catch {}
+  if (r.status === 401 || r.status === 403) throw hfError(repo, r.status, String(m));
+  if (r.status === 404) throw Object.assign(new Error(`${repo} was not found on Hugging Face (or it is private and HF_TOKEN has no access${process.env.HF_TOKEN ? '' : '; HF_TOKEN is not set'}).`), { kind: 'gated' });
+}
 async function hfShards(repo, opts = {}) {
+  await hfAccess(repo);
   try { return await hfShardsApi(repo, opts); } catch (e) {
     try { return await hfShardsHub(repo, opts); } catch (e2) {
       throw e2.kind === 'gated' || e.kind === 'other' && e2.kind !== 'other' ? e2 : e;
@@ -139,6 +149,7 @@ function ensureHttpfs(c) {
       await c.run(`INSTALL ${q(f)}`); await c.run('LOAD httpfs');
     }
     await c.run('SET parquet_metadata_cache = true');
+    await c.run("CALL enable_logging('HTTP')").catch(() => {}); // to report network_bytes of partial fetches
     if (process.env.HF_TOKEN) await c.run(`CREATE OR REPLACE SECRET sieve_hf (TYPE http, SCOPE 'https://huggingface.co', EXTRA_HTTP_HEADERS MAP {'Authorization': ${q('Bearer ' + process.env.HF_TOKEN)}})`);
   })().catch((e) => { httpfsReady = null; throw e; });
   return httpfsReady;
@@ -146,10 +157,19 @@ function ensureHttpfs(c) {
 const httpError = (repo, e) => { const m = String(e.message || e), s = +(m.match(/\b(401|403)\b/) || [])[1]; return s ? hfError(repo, s, m) : e; };
 const seededShuffle = (arr, seed) => { const a = [...arr], r = rng(seed); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 // Partial HF fetch into small local files, reading only the needed columns and row groups.
-// fetch="random" (default): seeded random row groups from up to 16 shards (at least 8 groups when there are that many);
+// fetch="random" (default): seeded random rows from seeded random row groups of up to 16 shards. Each group gives at most
+// max_rows_per_group rows (default ceil(limit/16), so >= 16 groups when there are that many), or the sample is spread
+// over `row_groups` groups. More groups = better spread but more bytes (a group's column chunks are read whole).
 // fetch="head": the first `limit` rows.
-async function fetchHfRemote(c, repo, urls, limit, id, { fetch: mode = 'random', seed = 42, columns } = {}) {
+async function fetchHfRemote(c, repo, urls, limit, id, { fetch: mode = 'random', seed = 42, columns, row_groups, max_rows_per_group, info } = {}) {
   await ensureHttpfs(c);
+  await c.run('CALL truncate_duckdb_logs()').catch(() => {});
+  try { return await fetchHfRemoteInner(c, repo, urls, limit, id, { mode, seed, columns, row_groups, max_rows_per_group, info }); } finally {
+    if (info) info.network_bytes = await c.runAndReadAll(`SELECT coalesce(sum(TRY_CAST(response.headers['content-length'] AS BIGINT)), 0)::BIGINT n
+      FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'GET'`).then((r) => Number(r.getRowObjectsJson()[0].n)).catch(() => undefined);
+  }
+}
+async function fetchHfRemoteInner(c, repo, urls, limit, id, { mode, seed, columns, row_groups, max_rows_per_group, info }) {
   const proj = columns?.length ? columns.map(ident).join(', ') : '* EXCLUDE (file_row_number)';
   const sel = (u, i, cond = '') => `SELECT ${proj}, file_row_number + ${i * SHARD} AS ${ROWCOL} FROM read_parquet(${q(u)}, file_row_number=true)${cond}`;
   const files = []; let have = 0;
@@ -170,17 +190,20 @@ async function fetchHfRemote(c, repo, urls, limit, id, { fetch: mode = 'random',
       for (const g of (await c.runAndReadAll(`SELECT row_group_id g, max(row_group_num_rows) n FROM parquet_metadata(${q(u)}) GROUP BY 1 ORDER BY 1`)).getRowObjectsJson())
         groups.push({ u, i, start: (start += +g.n) - +g.n, n: +g.n });
     }
-    const avg = groups.reduce((a, g) => a + g.n, 0) / Math.max(1, groups.length);
-    const per = Math.ceil(limit / Math.min(groups.length, Math.max(8, Math.ceil(limit / avg))));
+    const G = Math.min(groups.length, Math.max(1, row_groups > 0 ? +row_groups : Math.ceil(limit / (max_rows_per_group > 0 ? +max_rows_per_group : Math.ceil(limit / 16)))));
+    const per = Math.ceil(limit / G);
     const take = [];
-    for (const g of seededShuffle(groups, seed + 1)) {
+    for (const [k, g] of seededShuffle(groups, seed + 1).entries()) {
       if (have >= limit) break;
       const n = Math.min(per, g.n, limit - have);
-      take.push({ ...g, n }); have += n;
+      // a seeded random subset of the group's rows (all of them when n = group size)
+      const rows = n >= g.n ? null : seededShuffle(Array.from({ length: g.n }, (_, j) => g.start + j), seed + 2 + k).slice(0, n).sort((a, b) => a - b);
+      take.push({ ...g, size: g.n, n, rows }); have += n;
     }
+    if (info) info.row_groups = take.length;
     for (const i of [...new Set(take.map((g) => g.i))].sort((a, b) => a - b)) {
       const parts = take.filter((g) => g.i === i).sort((a, b) => a.start - b.start)
-        .map((g) => `(${sel(g.u, i, ` WHERE file_row_number BETWEEN ${g.start} AND ${g.start + g.n - 1}`)})`);
+        .map((g) => `(${sel(g.u, i, ` WHERE file_row_number BETWEEN ${g.start} AND ${g.start + g.size - 1}${g.rows ? ` AND file_row_number IN (${g.rows.join(',')})` : ''}`)})`);
       const f = path.join(DL_DIR, `${id}-${i}.parquet`);
       await c.run(`COPY (${parts.join(' UNION ALL ')}) TO ${q(f)} (FORMAT parquet)`);
       files.push(f);
@@ -263,7 +286,7 @@ function neededColumns(names, opts) {
   for (const p of [opts.where, ...(opts.splits || []).map((x) => x?.where)].filter(Boolean))
     for (const n of names) if (new RegExp(`(^|[^\\w])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^\\w])`).test(p)) used.add(n);
   for (const fo of [opts.field_options, ...(opts.splits || []).map((p) => p?.field_options)].flatMap((x) => Object.values(x || {})))
-    for (const g of [fo?.gold_from?.column].filter(Boolean).map((x) => String(x).split(/[.[]/)[0])) if (names.includes(g)) used.add(g);
+    for (const g of [fo?.gold_from?.column, ...(fo?.gold_from?.argmax_of || [])].filter(Boolean).map((x) => String(x).split(/[.[]/)[0])) if (names.includes(g)) used.add(g);
   return used.size ? [...used] : null;
 }
 // Local files to re-import: a dataset_id (its files in data/downloads) or a glob pattern.
@@ -301,7 +324,7 @@ export async function importDataset(url, opts = {}) {
         columns = neededColumns(names, opts);
       } catch (e) { if (opts.columns?.length || e.kind) throw e; }
     }
-    const fetchOpts = { fetch: opts.fetch === 'head' ? 'head' : 'random', seed: intOr(opts.seed, 42), columns };
+    const fetchOpts = { fetch: opts.fetch === 'head' ? 'head' : 'random', seed: intOr(opts.seed, 42), columns, row_groups: intOr(opts.row_groups, 0), max_rows_per_group: intOr(opts.max_rows_per_group, 0), info: {} };
     const tries = limit ? [['httpfs', () => fetchHfRemote(c, repo, hf.urls, limit, id, fetchOpts)]] : [];
     if (limit && limit <= 1000 && fetchOpts.fetch === 'head') tries.push(['rows-api', () => fetchHfRows(c, repo, hf, limit, id)]);
     tries.push(['download', () => fetchHfFull(c, repo, hf.urls, limit, id)]);
@@ -312,7 +335,7 @@ export async function importDataset(url, opts = {}) {
         hf.errors = [...(hf.errors || []), `${via}: ${String(e.message || e).slice(0, 200)}`];
       }
     }
-    if (hf.via === 'httpfs') Object.assign(hf, { fetch: fetchOpts.fetch, ...(fetchOpts.fetch === 'random' && { seed: fetchOpts.seed }), ...(columns && { columns }) });
+    if (hf.via === 'httpfs') Object.assign(hf, { fetch: fetchOpts.fetch, ...(fetchOpts.fetch === 'random' && { seed: fetchOpts.seed, row_groups: fetchOpts.info.row_groups }), network_bytes: fetchOpts.info.network_bytes, ...(columns && { columns }) });
     features = hf.features || await parquetFeatures(c, files[0]) || (hf.via === 'httpfs' && await parquetFeatures(c, hf.urls[0]));
     hf.shards = `${new Set(files.map((f) => f.match(/-(\d+)\.parquet$/)[1])).size}/${hf.urls.length}`;
     origin = { repo, config: hf.config, split: hf.split, url: `https://huggingface.co/datasets/${repo}`, limit };
@@ -355,7 +378,7 @@ export async function importDataset(url, opts = {}) {
   const st = {
     dataset_id: id, url, src, row_col: rowCol, limit, tables, table, format, columns: cols, row_count: rowCount, origin,
     source_key: origin ? `hf:${origin.repo}/${origin.config}/${origin.split}` : `${format}:${url}${table ? `#${table}` : ''}`,
-    hf: hf && { repo, config: hf.config, split: hf.split, shards: hf.shards, via: hf.via, ...(hf.fetch && { fetch: hf.fetch }), ...(hf.seed != null && { seed: hf.seed }), ...(hf.columns && { columns: hf.columns }), ...(hf.listing && { listing: hf.listing }), ...(hf.errors && { fallback_errors: hf.errors }) },
+    hf: hf && { repo, config: hf.config, split: hf.split, shards: hf.shards, via: hf.via, ...(hf.fetch && { fetch: hf.fetch }), ...(hf.seed != null && { seed: hf.seed }), ...(hf.row_groups && { row_groups: hf.row_groups }), ...(hf.network_bytes != null && { network_bytes: hf.network_bytes }), ...(hf.columns && { columns: hf.columns }), ...(hf.listing && { listing: hf.listing }), ...(hf.errors && { fallback_errors: hf.errors }) },
     files, download_bytes: bytesOf(files), class_labels: classLabels(features),
     metadata: [{ key: 'name', value: name }, { key: 'domain', value: 'general' }, { key: 'source', value: url }],
     meta_column: null, field_options: {},
@@ -363,6 +386,7 @@ export async function importDataset(url, opts = {}) {
   };
   useSchema(st, opts.schema || 'default');
   if (opts.mapping) Object.assign(st.mapping, normMapping(st, opts.mapping));
+  if (opts.field_options) st.field_options = normFieldOptions(st, opts.field_options);
   datasets.set(id, st);
   return summary(st);
 }
@@ -474,6 +498,10 @@ function normMapping(st, mapping) {
   }
   return out;
 }
+const goldFromCheck = (g, at) => {
+  if (!g.column && !Array.isArray(g.argmax_of)) throw new Error(`${at}: needs column or argmax_of: [paths]`);
+  if (g.ties != null && !['skip', 'first'].includes(g.ties)) throw new Error(`${at}.ties must be skip or first`);
+};
 // Per-dataset (or per-split) changes to schema field properties, e.g. {label: {label_mode: "index"}, option_labels: {gold_from: {...}}}.
 function normFieldOptions(st, fo) {
   const out = {};
@@ -483,6 +511,8 @@ function normFieldOptions(st, fo) {
     if (typeof o !== 'object' || 'name' in o || 'type' in o) throw new Error(`field_options.${field}: an object of field properties (not name/type)`);
     if (o.label_mode != null && !LABEL_MODES.includes(o.label_mode)) throw new Error(`field_options.${field}.label_mode must be one of ${LABEL_MODES}`);
     if (o.gold_from?.column) checkRef(st, o.gold_from.column, `field_options.${field}.gold_from`);
+    if (o.gold_from) goldFromCheck(o.gold_from, `field_options.${field}.gold_from`);
+    for (const p of o.gold_from?.argmax_of || []) checkRef(st, p, `field_options.${field}.gold_from.argmax_of`);
     out[field] = o;
   }
   return out;
@@ -511,6 +541,22 @@ export async function setMetadata(id, meta = {}, opts = {}) {
   }
   if (opts.overrides) Object.assign(st.overrides, opts.overrides);
   return summary(st);
+}
+
+// ---- Ordered JSON ----
+// JS objects list integer-like keys ("0", "1") first. Objects built with ordered() remember their key order
+// (non-enumerable), and toJson() writes them in that order. Used for DuckDB JSON values and API responses.
+const ORDER = Symbol('order');
+const ordered = (pairs) => Object.defineProperty(Object.fromEntries(pairs), ORDER, { value: pairs.map(([k]) => String(k)) });
+export function toJson(v, step = 0, ind = '') {
+  if (v != null && typeof v.toJSON === 'function') v = v.toJSON();
+  if (v === undefined || typeof v === 'function') return undefined;
+  if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'null';
+  const inner = ind + ' '.repeat(step), nl = step ? '\n' + inner : '', end = step ? '\n' + ind : '';
+  if (Array.isArray(v)) return v.length ? `[${v.map((x) => nl + (toJson(x, step, inner) ?? 'null')).join(',')}${end}]` : '[]';
+  const keys = v[ORDER] ? [...v[ORDER], ...Object.keys(v).filter((k) => !v[ORDER].includes(k))] : Object.keys(v);
+  const e = keys.map((k) => [k, toJson(v[k], step, inner)]).filter(([, x]) => x !== undefined);
+  return e.length ? `{${e.map(([k, x]) => `${nl}${JSON.stringify(k)}:${step ? ' ' : ''}${x}`).join(',')}${end}}` : '{}';
 }
 
 // ---- Row conversion ----
@@ -610,7 +656,7 @@ function distribution(f, val, multi, o) {
   const r = P.map((p) => Math.round(p * 1e6) / 1e6);
   const fix = 1 - r.reduce((a, b) => a + b, 0); // keep the sum exactly 1 after rounding
   if (fix) { const m = r.indexOf(Math.max(...r)); r[m] = Math.round((r[m] + fix) * 1e6) / 1e6; }
-  return { probabilities: f.as === 'list' ? ids.map((id, i) => ({ id, p: r[i] })) : Object.fromEntries(ids.map((id, i) => [id, r[i]])) };
+  return { probabilities: f.as === 'list' ? ids.map((id, i) => ({ id, p: r[i] })) : ordered(ids.map((id, i) => [id, r[i]])) };
 }
 const argmax = (d, ids) => {
   const ps = Array.isArray(d.probabilities) ? d.probabilities.map((x) => x.p) : ids.map((id) => d.probabilities[id]);
@@ -654,10 +700,15 @@ function convertRow(r, st) {
     else if (f.transform === 'metadata') v = meta[f.value || f.name];
     else if (f.transform === 'meta') v = null;
     else if (f.transform === 'join' && cols.length > 1) v = cols.map((c) => `${c}: ${asText(pick(r, c)) ?? ''}`).join('\n');
-    else if (f.transform === 'shuffle') { // gold = gold_from {column, map} (value -> item index or mapped column name), else the first item
+    else if (f.transform === 'shuffle') { // gold = gold_from {column, map} (value -> item index or mapped column name) or {argmax_of}, else the first item
       const items = cols.length > 1 ? cols.map((c) => pick(r, c)) : asList(cols.length ? pick(r, cols[0]) : null);
       let g = 0;
-      if (f.gold_from?.column) {
+      if (f.gold_from?.argmax_of) { // gold = item with the highest score; ties (or no scores): skip the row, or take the first
+        const sc = f.gold_from.argmax_of.map((p) => { const x = pick(r, p); return isNum(x) ? Number(x) : -Infinity; });
+        const best = Math.max(...sc), n = sc.filter((x) => x === best).length;
+        g = best === -Infinity ? -1 : sc.indexOf(best);
+        if ((n > 1 || g < 0) && (f.gold_from.ties || 'skip') === 'skip') out._skipped = n > 1 && g >= 0 ? 'gold tie' : 'no gold score';
+      } else if (f.gold_from?.column) {
         const gv = asText(pick(r, f.gold_from.column)), m = f.gold_from.map ? f.gold_from.map[gv] : gv;
         g = cols.length > 1 && typeof m === 'string' && cols.includes(m) ? cols.indexOf(m) : isNum(m) && Number.isInteger(+m) ? +m : -1;
         if (g >= (items?.length || 0)) g = -1;
@@ -670,7 +721,7 @@ function convertRow(r, st) {
         if (f.gold_field) gold[f.gold_field] = gi; else meta.gold_index = gi;
       } else v = null;
     }
-    else if (f.transform === 'options_dict') v = o.opts?.length ? (f.as === 'object' ? Object.fromEntries(o.ids.map((id, i) => [id, o.opts[i]])) : o.ids.map((id, i) => ({ id, text: o.opts[i] }))) : null;
+    else if (f.transform === 'options_dict') v = o.opts?.length ? (f.as === 'object' ? ordered(o.ids.map((id, i) => [id, o.opts[i]])) : o.ids.map((id, i) => ({ id, text: o.opts[i] }))) : null;
     else if (f.transform === 'label_to_distribution') {
       v = cols.length > 1 ? distribution(f, cols.map((c) => pick(r, c)), true, o)
         : distribution(f, cols.length ? pick(r, cols[0]) : raw[o.labelField] ?? null, false, o);
@@ -776,18 +827,33 @@ export async function convertAndWrite(id, o = {}) {
     const c = await memConn();
     const pool = `SELECT * FROM ${numbered(st)} WHERE ${filter}${excluded.length ? ` AND __row NOT IN (${excluded.join(',')})` : ''}`;
     const poolRows = Number((await c.runAndReadAll(`SELECT count(*) n FROM (${pool})`)).getRowObjectsJson()[0].n);
-    // Seeded, reproducible sample: order by hash(row_number, seed).
-    const raw = await readRows(c, `${pool} ORDER BY hash(__row, ${seed}) LIMIT ${parts.reduce((a, p) => a + p.n, 0)}`);
+    // Seeded, reproducible sample: order by hash(row_number, seed). Rows that are skipped (missing a required field,
+    // gold tie) are replaced by the next rows of the order, so each part gets n rows while the pool lasts.
+    const want = parts.reduce((a, p) => a + p.n, 0);
+    let buf = [], off = 0, done = false;
+    const next = async () => {
+      if (!buf.length && !done) {
+        const b = Math.max(want - off, 0) + 200;
+        buf = await readRows(c, `${pool} ORDER BY hash(__row, ${seed}), __row LIMIT ${b} OFFSET ${off}`);
+        off += buf.length; done = buf.length < b;
+      }
+      return buf.shift();
+    };
     const req = F.filter((f) => f.required).map((f) => f.name);
-    let at = 0;
-    const written = views.map((v, i) => {
-      const chunk = raw.slice(at, (at += parts[i].n));
-      return chunk.map((r) => convertRow(r, v)).filter((r) => req.every((k) => r[k] != null));
-    });
+    const written = [], skipped = [];
+    for (const [i, v] of views.entries()) {
+      const rows = []; let sk = 0;
+      while (rows.length < parts[i].n) {
+        const r = await next(); if (!r) break;
+        const x = convertRow(r, v);
+        if (x._skipped || !req.every((k) => x[k] != null)) sk++; else rows.push(x);
+      }
+      written.push(rows); skipped.push(sk);
+    }
     await conn.run('BEGIN');
     const names = ['id', 'dataset_id', 'write_key', 'source_row', ...F.map((f) => f.name)];
     const ins = await conn.prepare(`INSERT INTO ${T} (${names.map((n) => `"${n}"`).join(',')}) VALUES (${names.map((_, i) => '$' + (i + 1)).join(',')})`);
-    const enc = (f, v) => (v == null ? null : ['list', 'json'].includes(f.type) ? JSON.stringify(v) : v);
+    const enc = (f, v) => (v == null ? null : ['list', 'json'].includes(f.type) ? toJson(v) : v);
     for (const [i, v] of views.entries()) {
       await conn.run(`DELETE FROM ${T} WHERE dataset_id = $1 AND coalesce(write_key, '') = $2`, [st.dataset_id, v.write_key]);
       await conn.run('DELETE FROM datasets WHERE dataset_id = $1 AND table_name = $2 AND write_key = $3', [st.dataset_id, st.schema.table, v.write_key]);
@@ -805,7 +871,8 @@ export async function convertAndWrite(id, o = {}) {
     const rows_written = written.reduce((a, w) => a + w.length, 0);
     return { ...(cleaned && { cleanup: cleaned }), mode, dataset_id: st.dataset_id, schema: st.schema.name, table: st.schema.table, target: displayName(tg.tpath), rows_written, total_rows_in_target: total, seed,
       pool_rows: poolRows, ...(excluded.length && { excluded_rows: excluded.length }),
-      ...(o.splits?.length ? { splits: parts.map((p, i) => ({ tag: p.key, requested: p.n, rows_written: written[i].length })) } : { write_key: parts[0].key }) };
+      ...(skipped.some(Boolean) && { rows_skipped: skipped.reduce((a, b) => a + b, 0) }),
+      ...(o.splits?.length ? { splits: parts.map((p, i) => ({ tag: p.key, requested: p.n, rows_written: written[i].length, ...(skipped[i] && { rows_skipped: skipped[i] }) })) } : { write_key: parts[0].key }) };
   } catch (e) {
     await conn.run('ROLLBACK').catch(() => {});
     throw e;
@@ -837,8 +904,8 @@ export async function deleteDataset(id, { target = 'datasets.duckdb', write_key 
 }
 
 // One shot: HF name/URL + schema -> download, auto-map, sample, write.
-export async function runPipeline({ url, schema = 'default', config, split, format, table, limit, fetch, columns, fetch_seed, metadata, target_column, mapping, overrides, field_options, target, mode, ...write }) {
-  const imp = await importDataset(url, { schema, config, split, format, table, limit, fetch, columns, seed: fetch_seed, mapping, metadata, where: write.where, splits: write.splits, field_options });
+export async function runPipeline({ url, schema = 'default', config, split, format, table, limit, fetch, columns, fetch_seed, row_groups, max_rows_per_group, metadata, target_column, mapping, overrides, field_options, target, mode, ...write }) {
+  const imp = await importDataset(url, { schema, config, split, format, table, limit, fetch, columns, seed: fetch_seed, row_groups, max_rows_per_group, mapping, metadata, where: write.where, splits: write.splits, field_options });
   await setMetadata(imp.dataset_id, metadata, { mapping, overrides, target_column, field_options });
   const res = await convertAndWrite(imp.dataset_id, { ...write, target, mode: mode || (fs.existsSync(resolveTarget(target)) ? 'append' : 'create') });
   return { ...res, download_bytes: imp.download_bytes, hf: imp.hf, mapping: datasets.get(imp.dataset_id).mapping };

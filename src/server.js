@@ -9,7 +9,7 @@ import { buildMcpServer } from './mcp.js';
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public')));
-const h = (fn) => async (req, res) => { try { res.json(await fn(req)); } catch (e) { res.status(400).json({ error: String(e.message || e) }); } };
+const h = (fn) => async (req, res) => { try { res.type('json').send(core.toJson(await fn(req))); } catch (e) { res.status(400).json({ error: String(e.message || e) }); } };
 
 app.get('/api/datasets', h(() => core.listDatasets()));
 app.get('/api/schemas', h(() => schemas.listSchemas()));

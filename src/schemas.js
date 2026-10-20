@@ -39,7 +39,8 @@ export function validateSchema(s) {
     if (f.ids && !['text', 'index'].includes(f.ids)) throw new Error(`field ${f.name}: ids must be text or index`);
     if (f.label_mode && !['auto', 'text', 'index', 'numeric'].includes(f.label_mode)) throw new Error(`field ${f.name}: label_mode must be auto, text, index or numeric`);
     if (f.as && !['object', 'list'].includes(f.as)) throw new Error(`field ${f.name}: as must be object or list`);
-    if (f.gold_from && !f.gold_from.column) throw new Error(`field ${f.name}: gold_from needs a column`);
+    if (f.gold_from && !f.gold_from.column && !Array.isArray(f.gold_from.argmax_of)) throw new Error(`field ${f.name}: gold_from needs column or argmax_of`);
+    if (f.gold_from?.ties != null && !['skip', 'first'].includes(f.gold_from.ties)) throw new Error(`field ${f.name}: gold_from.ties must be skip or first`);
   }
   return s;
 }

@@ -6,6 +6,9 @@ import assert from 'node:assert/strict';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sieve-test-'));
 process.env.DATA_DIR = dir;
+process.env.SCHEMAS_DIR = path.join(dir, 'schemas');
+fs.mkdirSync(process.env.SCHEMAS_DIR);
+fs.copyFileSync(new URL('../schemas/default.json', import.meta.url), path.join(process.env.SCHEMAS_DIR, 'default.json'));
 const core = await import('../src/core.js');
 const { DuckDBInstance } = await import('@duckdb/node-api');
 const query = async (sql) => {
@@ -77,6 +80,31 @@ fs.writeFileSync(src3, JSON.stringify({ q: 'd', opts: { true: 'Yes', false: 'No'
 const d4 = await core.importDataset(src3, { limit: 'all', mapping: { input: ['q'], options: ['opts'], label: ['ans'] } });
 const c4 = (await core.preview(d4.dataset_id, 1)).converted[0]; // explicit ids {id: text}
 assert.equal(c4.label, 'Yes'); assert.deepEqual(c4.target, { probabilities: { true: 1, false: 0 } });
+
+// ordered JSON: {id: …} objects keep option order (integer-like keys are not moved first); argmax_of gold with ties
+const schemas = await import('../src/schemas.js');
+schemas.saveSchema({ name: 'pick', table: 'pick', fields: [
+  { name: 'prompt', type: 'text' },
+  { name: 'options', type: 'list', transform: 'shuffle', gold_field: 'label', gold_from: { argmax_of: ['s1', 's2', 's3'] } },
+  { name: 'label', type: 'integer' },
+  { name: 'opts', type: 'json', transform: 'options_dict', option_field: 'options', as: 'object' },
+  { name: 'target', type: 'json', transform: 'label_to_distribution', option_field: 'options', ids: 'index', label_field: 'label' },
+  { name: 'meta', type: 'json', transform: 'meta' }] });
+const src5 = path.join(dir, 'src5.jsonl');
+fs.writeFileSync(src5, Array.from({ length: 30 }, (_, i) => JSON.stringify({ p: `p${i}`, a: 'b', b: '10', c: '2', s1: i % 3 ? 1 : 5, s2: i % 3 === 1 ? 9 : 1, s3: 1 })).join('\n'));
+const d5 = await core.importDataset(src5, { limit: 'all', schema: 'pick', mapping: { prompt: ['p'], options: ['a', 'b', 'c'] } });
+const w5 = await core.convertAndWrite(d5.dataset_id, { target: 'p', mode: 'create', sample: 15 });
+assert.equal(w5.rows_written, 15); assert.ok(w5.rows_skipped > 0); // i % 3 === 2 rows are ties (1, 1, 1) and get replaced
+const pq = async (sql) => { const i = await DuckDBInstance.create(path.join(dir, 'p.duckdb')); const c = await i.connect(); try { return (await c.runAndReadAll(sql)).getRowObjectsJS(); } finally { c.closeSync(); i.closeSync(); } };
+const rows5 = await pq('SELECT source_row, options::VARCHAR o, label, opts::VARCHAR d FROM pick');
+for (const x of rows5) {
+  const o = JSON.parse(x.o);
+  assert.equal(o[Number(x.label)], Number(x.source_row) % 3 === 0 ? 'b' : '10'); // gold = the item with the highest score
+  assert.equal(x.d, `{${o.map((t) => `${JSON.stringify(t)}:${JSON.stringify(t)}`).join(',')}}`); // stored in option order
+}
+assert.ok(rows5.some((x) => x.d.startsWith('{"b"')));
+const w6 = await core.convertAndWrite(d5.dataset_id, { target: 'p', write_key: 'first', sample: 30, field_options: { options: { gold_from: { argmax_of: ['s1', 's2', 's3'], ties: 'first' } } } });
+assert.equal(w6.rows_written, 30); assert.equal(w6.rows_skipped, undefined);
 
 fs.rmSync(dir, { recursive: true, force: true });
 console.log('smoke test passed');
