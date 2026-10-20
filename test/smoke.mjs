@@ -169,5 +169,90 @@ assert.equal((await core.preview(d9.dataset_id, 1)).converted[0]._skipped, 'dupl
 await core.setMetadata(d9.dataset_id, {}, { field_options: { options: { allow_duplicates: true } } });
 assert.equal((await core.preview(d9.dataset_id, 1)).converted[0]._skipped, undefined);
 
+
+// explode drops the list column, extract keeps values of the whole list; row cap errors cleanly
+assert.ok(!d8.columns.some((c) => c.name === 'actions'));
+const d8x = await core.importDataset(src8, { limit: 'all', explode: { column: 'actions', as: 'action', history: 1, extract: { first_op: 'actions[0].op' } } });
+const x8 = (await core.preview(d8x.dataset_id, 2, 'explode_step = 1')).raw[0];
+assert.equal(x8.first_op, 'click'); assert.equal(x8.explode_history.length, 1); assert.equal(x8.actions, undefined);
+const d8m = await core.importDataset(src8, { limit: 'all', explode: { column: 'actions', as: 'action' }, mapping: { input: ['actions[0].op'], label: ['action.op'] } });
+assert.equal((await core.preview(d8m.dataset_id, 1)).converted[0].input, 'click');
+await assert.rejects(core.setMetadata(d8m.dataset_id, {}, { mapping: { input: ['actions[1].op'] } }), /explode dropped the list column actions; keep values from it with explode.extract/);
+core.LIMITS.max_rows = 10;
+await assert.rejects(core.importDataset(src8, { limit: 'all', explode: 'actions' }), /explode would make 24 rows \(limit SIEVE_MAX_ROWS/);
+core.LIMITS.max_rows = 5_000_000;
+
+// balance in SQL with a regex value_from key; distinct_by applies within each stratum; max_per_value
+const vf = { label: { value_from: { column: 'action.op', map: { '/^CL/i': 'true', '*': 'false' } } } };
+const wr = await core.convertAndWrite(d8.dataset_id, { target: 'x', write_key: 'r', sample: 12, balance: 'label', overrides: { options: ['true', 'false'] }, field_options: vf });
+assert.deepEqual(wr.strata, { true: 6, false: 6 });
+// every task has a click step; only t1, t2, t4, t5 have type steps: distinct first would have lost clicks, per stratum keeps them
+const wdb = await core.convertAndWrite(d8.dataset_id, { target: 'x', write_key: 'db', sample: 20, balance: 'label', distinct_by: 'task', overrides: { options: ['true', 'false'] }, field_options: vf });
+assert.deepEqual(wdb.strata, { true: 6, false: 4 });
+const wm = await core.convertAndWrite(d8.dataset_id, { target: 'x', write_key: 'm', sample: 24, distinct_by: 'task', max_per_value: 2 });
+assert.equal(wm.rows_written, 12);
+await assert.rejects(core.convertAndWrite(d8.dataset_id, { target: 'x', write_key: 'z', sample: 5, balance: 'domain' }), /balance: domain is not mapped/);
+
+// per-write overrides stay in that write; set_metadata overrides can be removed (null) or cleared
+assert.notDeepEqual((await core.preview(d8.dataset_id, 1)).converted[0].options, ['true', 'false']);
+await core.setMetadata(d8.dataset_id, {}, { overrides: { options: ['p', 'q'], decision_type: 'score' } });
+assert.deepEqual((await core.preview(d8.dataset_id, 1)).converted[0].options, ['p', 'q']);
+await core.setMetadata(d8.dataset_id, {}, { overrides: { options: null } });
+let c8 = (await core.preview(d8.dataset_id, 1)).converted[0];
+assert.notDeepEqual(c8.options, ['p', 'q']); assert.equal(c8.decision_type, 'score');
+await core.setMetadata(d8.dataset_id, {}, { clear_overrides: true });
+assert.equal((await core.preview(d8.dataset_id, 1)).converted[0].decision_type, 'choice');
+
+// value_counts: JSON text inside a struct path; preview's where applies to the counts
+const srcJ = path.join(dir, 'srcj.jsonl');
+fs.writeFileSync(srcJ, Array.from({ length: 10 }, (_, i) => JSON.stringify({ k: i % 2, turn: { calls: [{ args: JSON.stringify({ command: i < 7 ? 'view' : 'edit', n: i }) }] } })).join('\n'));
+const dJ = await core.importDataset(srcJ, { limit: 'all' });
+const vj = (await core.preview(dJ.dataset_id, 0, 'k = 0', { value_counts: { column: 'turn.calls[0].args.command' } })).value_counts;
+assert.equal(vj.rows, 5); assert.deepEqual(vj.values, [{ value: 'view', count: 4 }, { value: 'edit', count: 1 }]);
+const vj2 = (await core.preview(dJ.dataset_id, 0, 'k = 0', { value_counts: { column: 'turn.calls[0].args.command', where: 'len(turn.calls) = 1 AND k + 0 = 0' } })).value_counts;
+assert.equal(vj2.rows, 5);
+
+// skip_unknown_labels: a label that is not an option is skipped and refilled
+const srcU = path.join(dir, 'srcu.jsonl');
+fs.writeFileSync(srcU, Array.from({ length: 20 }, (_, i) => JSON.stringify({ q: `q${i}`, o: ['a', 'b'], l: i % 4 ? 'a' : 'zzz' })).join('\n'));
+const dU = await core.importDataset(srcU, { limit: 'all', mapping: { input: ['q'], options: ['o'], label: ['l'] } });
+const wu = await core.convertAndWrite(dU.dataset_id, { target: 'u', mode: 'create', sample: 15, skip_unknown_labels: true });
+assert.equal(wu.rows_written, 15); assert.ok(wu.rows_skipped >= 1); assert.deepEqual(Object.keys(wu.skip_reasons), ['unknown label in label']);
+const uq = async (sql) => { const i = await DuckDBInstance.create(path.join(dir, 'u.duckdb')); const c = await i.connect(); try { return (await c.runAndReadAll(sql)).getRowObjectsJS(); } finally { c.closeSync(); i.closeSync(); } };
+assert.deepEqual((await uq('SELECT DISTINCT label FROM rows')).map((x) => x.label), ['a']);
+
+// compact after delete: the file shrinks, rows stay
+const big = path.join(dir, 'big.jsonl');
+fs.writeFileSync(big, Array.from({ length: 3000 }, (_, i) => JSON.stringify({ q: `q${i} ${'lorem ipsum '.repeat(40)}`, o: ['a', 'b'], l: 'a' })).join('\n'));
+const dB = await core.importDataset(big, { limit: 'all', mapping: { input: ['q'], options: ['o'], label: ['l'] } });
+await core.convertAndWrite(dB.dataset_id, { target: 'u', write_key: 'big', sample: 3000 });
+const del = await core.deleteDataset(dB.dataset_id, { target: 'u', compact: true });
+assert.equal(del.rows_deleted, 3000); assert.ok(del.compact.bytes_after < del.compact.bytes_before, JSON.stringify(del.compact));
+assert.equal(Number((await uq('SELECT count(*) n FROM rows'))[0].n), 15);
+const cp = await core.compactTarget('u');
+assert.ok(cp.bytes_after > 0);
+
+// nested ClassLabel names (HF features inside a struct) become the options
+const pqf = path.join(dir, 'cl.parquet');
+const hfMeta = JSON.stringify({ info: { features: { q: { dtype: 'string', _type: 'Value' }, ann: { label: { names: ['neg', 'pos'], _type: 'ClassLabel' }, who: { dtype: 'string', _type: 'Value' } } } } });
+{ const i = await DuckDBInstance.create(); const c = await i.connect();
+  await c.run(`COPY (SELECT 'q' || x AS q, {'label': x % 2, 'who': 'w'} AS ann FROM range(6) t(x)) TO '${pqf}' (FORMAT parquet, KV_METADATA {huggingface: '${hfMeta}'})`); c.closeSync(); i.closeSync(); }
+const dC = await core.importDataset(pqf, { limit: 'all', mapping: { input: ['q'], label: ['ann.label'], options: [] } });
+const cC = (await core.preview(dC.dataset_id, 2)).converted;
+assert.deepEqual(cC.map((x) => [x.options, x.label]), [[['neg', 'pos'], 'neg'], [['neg', 'pos'], 'pos']]);
+
+// shuffle duplicates: "drop" removes repeated non-gold items and keeps the row
+schemas.saveSchema({ name: 'pick2', table: 'pick2', fields: [
+  { name: 'prompt', type: 'text' },
+  { name: 'options', type: 'list', transform: 'shuffle', gold_field: 'label', gold_from: { column: 'g' } },
+  { name: 'label', type: 'integer' }] });
+const srcD = path.join(dir, 'srcd.jsonl');
+fs.writeFileSync(srcD, JSON.stringify({ p: 'p', a: 'x', b: 'x ', c: 'y', g: 1 }));
+const dD = await core.importDataset(srcD, { limit: 'all', schema: 'pick2', mapping: { prompt: ['p'], options: ['a', 'b', 'c'] } });
+assert.equal((await core.preview(dD.dataset_id, 1)).converted[0]._skipped, 'duplicate options in options');
+await core.setMetadata(dD.dataset_id, {}, { field_options: { options: { duplicates: 'drop' } } });
+const cD = (await core.preview(dD.dataset_id, 1)).converted[0];
+assert.equal(cD._skipped, undefined); assert.equal(cD.options.length, 2); assert.equal(cD.options[cD.label], 'x ');
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log('smoke test passed');

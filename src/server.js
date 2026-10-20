@@ -24,6 +24,7 @@ app.post('/api/datasets/:id/metadata', h((r) => { const { metadata, ...o } = r.b
 app.post('/api/downloads/cleanup', h((r) => core.cleanupDownloads(r.body?.dataset_id)));
 app.get('/api/datasets/:id/profile', h((r) => core.profile(r.params.id, { top: r.query.top, where: r.query.where })));
 app.post('/api/copy', h((r) => core.copyRows(r.body)));
+app.post('/api/compact', h((r) => core.compactTarget(r.body?.target)));
 app.post('/api/datasets/:id/convert', h((r) => core.convertAndWrite(r.params.id, r.body)));
 
 // MCP over streamable HTTP (stateless: fresh server+transport per request; dataset state is shared in-process)
@@ -36,5 +37,7 @@ app.post('/mcp', async (req, res) => {
 });
 app.all('/mcp', (_req, res) => res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null }));
 
+// a failed request must not take the server down
+process.on('unhandledRejection', (e) => console.error('unhandled rejection:', e));
 const port = +process.env.PORT || 3000;
 app.listen(port, () => console.log(`Sieve DatasetConverter: http://localhost:${port}  (MCP: /mcp)`));

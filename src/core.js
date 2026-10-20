@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import zlib from 'node:zlib';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DATA_DIR = path.resolve(ROOT, process.env.DATA_DIR || 'data');
@@ -15,9 +17,30 @@ fs.mkdirSync(DL_DIR, { recursive: true });
 import { getSchema } from './schemas.js';
 
 const datasets = new Map(); // dataset_id -> state
+// Memory guards. DuckDB gets a memory limit (SIEVE_DUCKDB_MEMORY, default 25% of RAM) and spills to DATA_DIR/.tmp;
+// JS-side reads stop with a clean error when the process RSS passes SIEVE_MAX_RSS_MB (default 50% of RAM).
+const GB = 1024 ** 3;
+export const LIMITS = {
+  duckdb_memory: process.env.SIEVE_DUCKDB_MEMORY || `${Math.max(1, Math.floor(os.totalmem() * 0.25 / GB))}GB`,
+  max_rss_mb: +process.env.SIEVE_MAX_RSS_MB || Math.floor(os.totalmem() * 0.5 / 2 ** 20),
+  max_rows: +process.env.SIEVE_MAX_ROWS || 5_000_000, // rows of one import (after explode)
+};
+function memoryGuard(what) {
+  const mb = process.memoryUsage().rss / 2 ** 20;
+  if (mb > LIMITS.max_rss_mb) throw Object.assign(new Error(`${what}: Sieve is using ${Math.round(mb)} MB (limit SIEVE_MAX_RSS_MB=${LIMITS.max_rss_mb}). Use fewer rows or columns, a smaller limit or a where filter.`), { kind: 'memory' });
+}
+const oomHint = (e) => {
+  if (/Out of Memory/i.test(e?.message) && !e.kind) Object.assign(e, { kind: 'memory', message: `${e.message.split('\n')[0]} [DuckDB memory limit SIEVE_DUCKDB_MEMORY=${LIMITS.duckdb_memory}: use fewer rows or columns]` });
+  return e;
+};
 let mem;
 async function memConn() {
-  if (!mem) mem = await (await DuckDBInstance.create(':memory:')).connect();
+  if (!mem) {
+    mem = await (await DuckDBInstance.create(':memory:')).connect();
+    const tmp = path.join(DATA_DIR, '.tmp'); fs.mkdirSync(tmp, { recursive: true });
+    await mem.run(`SET memory_limit = ${q(LIMITS.duckdb_memory)}`);
+    await mem.run(`SET temp_directory = ${q(tmp)}`);
+  }
   return mem;
 }
 const duckSrc = (alias, t) => `${alias}.${t.split('.').map((x) => `"${x.replace(/"/g, '""')}"`).join('.')}`;
@@ -138,7 +161,8 @@ const limited = (src, limit) => (limit ? `(SELECT * FROM ${src} LIMIT ${limit})`
 async function download(url, dest, headers = {}) {
   const r = await fetch(url, { headers, redirect: 'follow' });
   if (!r.ok) throw new Error(`Download failed ${r.status} for ${url}`);
-  fs.writeFileSync(dest, Buffer.from(await r.arrayBuffer()));
+  // streamed to disk (a shard can be GBs)
+  try { await pipeline(Readable.fromWeb(r.body), fs.createWriteStream(dest)); } catch (e) { fs.rmSync(dest, { force: true }); throw e; }
 }
 const countRows = async (c, f) => Number((await c.runAndReadAll(`SELECT count(*) n FROM read_parquet(${q(f)})`)).getRowObjectsJson()[0].n);
 const ident = (n) => `"${String(n).replace(/"/g, '""')}"`;
@@ -233,11 +257,11 @@ async function fetchHfRemoteInner(c, repo, urls, limit, id, { mode, seed, column
   } catch (e) { throw httpError(repo, e); }
 }
 // Small limits: datasets-server /rows API, 100 rows per request (first rows).
-async function fetchHfRows(c, repo, hf, limit, id) {
-  const rows = [];
+async function fetchHfRows(c, repo, hf, limit, id, info = {}) {
+  const rows = []; info.rows_api_bytes = 0;
   for (let off = 0; off < limit; off += 100) {
     const j = await hfFetch(repo, `https://datasets-server.huggingface.co/rows?dataset=${encodeURIComponent(repo)}&config=${encodeURIComponent(hf.config)}&split=${encodeURIComponent(hf.split)}&offset=${off}&length=${Math.min(100, limit - off)}`);
-    const page = j.rows || [];
+    const page = j.rows || []; info.rows_api_bytes += Buffer.byteLength(JSON.stringify(j));
     hf.features ||= Object.fromEntries((j.features || []).map((x) => [x.name, x.type]));
     rows.push(...page.map((x) => ({ ...x.row, [ROWCOL]: x.row_idx })));
     if (page.length < 100) break;
@@ -283,8 +307,23 @@ async function parquetFeatures(c, fileOrUrl) {
     return r.length ? JSON.parse(r[0].v).info?.features || null : null;
   } catch { return null; }
 }
-const classNames = (t) => (!t ? null : Array.isArray(t) ? classNames(t[0]) : t._type === 'ClassLabel' ? t.names || null : t.feature ? classNames(t.feature) : null);
-const classLabels = (features) => Object.fromEntries(Object.entries(features || {}).map(([k, t]) => [k, classNames(t)]).filter(([, n]) => n));
+// ClassLabel names by column path, also inside structs and lists ("answers.label" for answers: {label: ClassLabel}).
+const classLabels = (features) => {
+  const out = {};
+  const walk = (t, p) => {
+    if (!t || typeof t !== 'object') return;
+    if (Array.isArray(t)) return walk(t[0], p);
+    if (t._type === 'ClassLabel') { if (t.names) out[p] = t.names; return; }
+    if (t._type) return walk(t.feature, p); // Sequence / List / LargeList
+    for (const [k, v] of Object.entries(t)) walk(v, p ? `${p}.${k}` : k);
+  };
+  walk(features, '');
+  return out;
+};
+const labelsFor = (st, ref) => { // ClassLabel names for a column ref: full path without indexes, then the root
+  const p = String(ref || '').replace(/\[(\d+|\*)\]/g, '');
+  return st.class_labels?.[p] || st.class_labels?.[p.split('.')[0]] || null;
+};
 // Sidecar "<id>.origin.json" next to HF downloads, so re-importing a downloaded file keeps its HF origin and features.
 const sidecarFor = (file) => {
   const m = path.basename(file).match(/^([0-9a-f]{8})-\d+\.parquet$/);
@@ -292,6 +331,12 @@ const sidecarFor = (file) => {
   return p && fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null;
 };
 
+// Column refs given to an import (mapping, metadata, field_options sources), for column pruning and explode.extract.
+const importRefs = (opts) => [...[opts.mapping, ...(opts.splits || []).map((p) => p?.mapping)].filter(Boolean).flatMap((m) => Object.values(m).flat()),
+  ...(Array.isArray(opts.metadata) ? opts.metadata.map((e) => e?.column) : []),
+  ...[opts.field_options, ...(opts.splits || []).map((p) => p?.field_options)].flatMap((x) => Object.values(x || {}))
+    .flatMap((fo) => [fo?.gold_from?.column, fo?.value_from?.column, ...(fo?.gold_from?.argmax_of || [])])]
+  .filter((x) => x != null && x !== 'source_row').map(String);
 // Columns an import needs: explicit `columns`, else the roots of mapping/metadata column refs plus columns named in `where`.
 function neededColumns(names, opts) {
   if (opts.columns?.length) {
@@ -339,7 +384,9 @@ export async function importDataset(url, opts = {}) {
     // limit: read only the needed rows remotely (httpfs; /rows API for <= 1000); else (or on failure) download whole shards.
     hf = await hfShards(repo, opts); format = 'parquet';
     let columns = null;
-    if (limit) {
+    // limit "all" with explicit columns: read just those columns of every shard remotely, not whole shards
+    const remoteAll = !limit && opts.columns?.length;
+    if (limit || remoteAll) {
       await ensureHttpfs(c);
       try {
         const names = (await c.runAndReadAll(`DESCRIBE SELECT * FROM read_parquet(${q(hf.urls[0])})`)).getRowObjectsJson().map((r) => r.column_name);
@@ -347,16 +394,21 @@ export async function importDataset(url, opts = {}) {
       } catch (e) { if (opts.columns?.length || e.kind) throw e; }
     }
     const fetchOpts = { fetch: opts.fetch === 'head' ? 'head' : 'random', seed: intOr(opts.seed, 42), columns, row_groups: intOr(opts.row_groups, 0), max_rows_per_group: intOr(opts.max_rows_per_group, 0), info: {} };
-    const tries = limit ? [['httpfs', () => fetchHfRemote(c, repo, hf.urls, limit, id, fetchOpts)]] : [];
-    if (limit && limit <= 1000 && fetchOpts.fetch === 'head') tries.push(['rows-api', () => fetchHfRows(c, repo, hf, limit, id)]);
+    if (remoteAll) fetchOpts.fetch = 'head';
+    const tries = limit || remoteAll ? [['httpfs', () => fetchHfRemote(c, repo, hf.urls, limit || Number.MAX_SAFE_INTEGER, id, fetchOpts)]] : [];
+    if (limit && limit <= 1000 && fetchOpts.fetch === 'head') tries.push(['rows-api', () => fetchHfRows(c, repo, hf, limit, id, fetchOpts.info)]);
     tries.push(['download', () => fetchHfFull(c, repo, hf.urls, limit, id)]);
     for (const [via, fn] of tries) {
       try { files = await fn(); hf.via = via; break; } catch (e) {
         ownFiles(id).forEach((f) => fs.rmSync(f, { force: true }));
-        if (e.kind === 'gated' || via === 'download') throw e;
+        oomHint(e); // a bigger route would not fit either
+        if (e.kind === 'gated' || e.kind === 'memory' || via === 'download') throw e;
         hf.errors = [...(hf.errors || []), `${via}: ${String(e.message || e).slice(0, 200)}`];
       }
     }
+    // network_bytes is reported for every route: httpfs = HTTP response bytes, rows-api = response bodies, download = files
+    if (hf.via === 'download') hf.network_bytes = bytesOf(files);
+    if (hf.via === 'rows-api') hf.network_bytes = fetchOpts.info.rows_api_bytes;
     if (hf.via === 'httpfs') Object.assign(hf, { fetch: fetchOpts.fetch, ...(fetchOpts.fetch === 'random' && { seed: fetchOpts.seed, row_groups: fetchOpts.info.row_groups }), network_bytes: fetchOpts.info.network_bytes, data_bytes: fetchOpts.info.data_bytes, cached_bytes: fetchOpts.info.cached_bytes, ...(columns && { columns }) });
     features = hf.features || await parquetFeatures(c, files[0]) || (hf.via === 'httpfs' && await parquetFeatures(c, hf.urls[0]));
     hf.shards = `${new Set(files.map((f) => f.match(/-(\d+)\.parquet$/)[1])).size}/${hf.urls.length}`;
@@ -394,7 +446,11 @@ export async function importDataset(url, opts = {}) {
   const describe = async (x) => (await c.runAndReadAll(`DESCRIBE SELECT * FROM ${x}`)).getRowObjectsJson().map((r) => ({ name: r.column_name, type: r.column_type }));
   let cols = await describe(src);
   let explode = null;
-  if (opts.explode) ({ src, explode } = explodeSrc(src, cols, opts.explode)), cols = await describe(src);
+  if (opts.explode) {
+    const e = await explodeFiles(c, src, cols, opts.explode, path.join(DL_DIR, `${id}-explode`), importRefs(opts));
+    explode = { ...e.explode, batches: e.files.length, file_bytes: bytesOf(e.files) };
+    src = `read_parquet([${e.files.map(q).join(', ')}], union_by_name=true)`; cols = await describe(src);
+  }
   const rowCol = cols.some((x) => x.name === ROWCOL);
   cols = cols.filter((x) => x.name !== ROWCOL);
   const rowCount = Number((await c.runAndReadAll(`SELECT count(*) n FROM ${src}`)).getRowObjectsJson()[0].n);
@@ -416,29 +472,49 @@ export async function importDataset(url, opts = {}) {
   return summary(st);
 }
 
-// explode: one row per element of a list column or path. The element goes into `as` (default: the column, or the
-// path's last name); explode_step (0-based), explode_steps and, with history, explode_history (the preceding elements,
-// or the last N) are added. source_row = source row × 1000 + step (lists are cut at 1000 elements).
-const EXPLODE_MAX = 1000;
-function explodeSrc(src, cols, ex) {
+// explode: one row per element of a list column or path, materialised by DuckDB into "<id>-explode.parquet".
+// The element goes into `as` (default: the column, or the path's last name); the list itself is dropped. Added columns:
+// explode_step (0-based), explode_steps, and with `history` (N, or true = up to EXPLODE_HISTORY) explode_history = the
+// preceding N elements. `extract: {name: path}` keeps values of the source row (e.g. the first message) as columns.
+// source_row = source row × 1000 + step (lists are cut at 1000 elements).
+const EXPLODE_MAX = 1000, EXPLODE_HISTORY = 100;
+const EXPLODE_BATCH_BYTES = (+process.env.SIEVE_EXPLODE_BATCH_MB || 4) * 2 ** 20;
+async function explodeFiles(c, src, cols, ex, outBase, refs = []) {
   ex = typeof ex === 'string' ? { column: ex } : ex || {};
   if (!ex.column) throw new Error('explode needs a column or path');
-  const st = { columns: cols.filter((x) => x.name !== ROWCOL) };
-  const ref = checkRef(st, ex.column, 'explode'), root = ref.split(/[.[]/)[0], type = st.columns.find((x) => x.name === root).type;
-  let list;
-  if (/^(JSON|VARCHAR)$/.test(type)) {
-    const toks = [...ref.slice(root.length).matchAll(/([^.[\]]+)|\[(\d+)\]/g)].map((m) => m[1] ?? m[2]);
-    list = `json_extract(${ident(root)}, ${q('$' + toks.map((t) => (/^\d+$/.test(t) ? `[${t}]` : `.${JSON.stringify(t)}`)).join('') + '[*]')})`;
-  } else list = pathSql(st, ref, 'explode');
+  const st = { columns: cols.filter((x) => x.name !== ROWCOL), src };
+  const ref = checkRef(st, ex.column, 'explode'), root = ref.split(/[.[]/)[0];
+  let list = await pathExpr(c, st, ref, 'explode', { list: true });
   const as = ex.as || (ref === root ? root : ref.split(/[.[\]]/).filter((t) => t && !/^\d+$/.test(t)).pop());
-  const h = ex.history === true ? EXPLODE_MAX : Math.max(0, intOr(ex.history, 0));
-  const base = cols.some((x) => x.name === ROWCOL) ? ROWCOL : 'row_number() OVER () - 1';
-  const drop = [...new Set(['__l', '__e', '__i', '__b', ...(cols.some((x) => x.name === ROWCOL) ? [ROWCOL] : []), ...(st.columns.some((x) => x.name === as) ? [as] : [])])].map(ident).join(', ');
-  const inner = `(SELECT *, unnest(__l) AS __e, generate_subscripts(__l, 1) AS __i FROM (SELECT *, list_slice(${list}, 1, ${EXPLODE_MAX}) AS __l, ${base} AS __b FROM ${src}))`;
-  return {
-    src: `(SELECT * EXCLUDE (${drop}), __e AS ${ident(as)}, (__i - 1)::BIGINT AS explode_step, len(__l)::BIGINT AS explode_steps${h ? `, list_slice(__l, greatest(1, __i - ${h}), __i - 1) AS explode_history` : ''}, (__b * ${EXPLODE_MAX} + __i - 1)::BIGINT AS ${ROWCOL} FROM ${inner})`,
-    explode: { column: ref, as, ...(h && { history: ex.history === true ? true : h }) },
-  };
+  const h = Math.min(ex.history === true ? EXPLODE_HISTORY : Math.max(0, intOr(ex.history, 0)), EXPLODE_HISTORY);
+  const extract = Object.entries(ex.extract || {});
+  // refs of the import's mapping/metadata into the dropped list (e.g. "trajectory[1].content") are extracted under their own name
+  if (as !== root) for (const r of new Set(refs)) if (r.split(/[.[]/)[0] === root && !r.includes('[*]') && !extract.some(([k]) => k === r)) extract.push([r, r]);
+  const ex2 = [];
+  for (const [name, p] of extract) ex2.push(`${await pathExpr(c, st, p, `explode.extract.${name}`, { raw: true })} AS ${ident(name)}`);
+  const hasRow = cols.some((x) => x.name === ROWCOL);
+  const keep = st.columns.map((x) => x.name).filter((n) => n !== root && n !== as && !extract.some(([k]) => k === n));
+  const total = Number((await c.runAndReadAll(`SELECT coalesce(sum(least(len(${list}), ${EXPLODE_MAX})), 0)::BIGINT n FROM ${src}`)).getRowObjectsJson()[0].n);
+  if (total > LIMITS.max_rows) throw Object.assign(new Error(`explode would make ${total.toLocaleString()} rows (limit SIEVE_MAX_ROWS=${LIMITS.max_rows.toLocaleString()}). Use a smaller limit or a where filter.`), { kind: 'memory' });
+  // 1) stage: the kept columns, extracts and the (cut) list, one row per source row, in small row groups (streamed)
+  // 2) explode in batches of source rows (so the history window and ordering only ever hold one batch)
+  const stage = `${outBase}.stage.parquet`;
+  await c.run(`COPY (SELECT ${[...keep.map(ident), ...ex2, `list_slice(${list}, 1, ${EXPLODE_MAX}) AS __l`, `${hasRow ? ROWCOL : 'row_number() OVER () - 1'} AS __b`, 'row_number() OVER () AS __k'].join(', ')} FROM ${src}) TO ${q(stage)} (FORMAT parquet, ROW_GROUP_SIZE 2048)`);
+  const files = [];
+  try {
+    const n = Number((await c.runAndReadAll(`SELECT count(*) n FROM read_parquet(${q(stage)})`)).getRowObjectsJson()[0].n);
+    const per = Math.max(1, Math.floor(n * EXPLODE_BATCH_BYTES / Math.max(1, fs.statSync(stage).size))); // ~4 MB of compressed lists per batch
+    for (let lo = 1, k = 0; lo <= n; lo += per, k++) {
+      const steps = `SELECT * EXCLUDE (__l, __k), unnest(__l) AS __e, generate_subscripts(__l, 1) AS __i, len(__l) AS __n FROM read_parquet(${q(stage)}) WHERE __k BETWEEN ${lo} AND ${lo + per - 1}`;
+      const hist = h ? `, list(__e) OVER (PARTITION BY __b ORDER BY __i ROWS BETWEEN ${h} PRECEDING AND 1 PRECEDING) AS __h` : '';
+      const sql = `SELECT * EXCLUDE (__e, __i, __n, __b${h ? ', __h' : ''}), __e AS ${ident(as)}, (__i - 1)::BIGINT AS explode_step, __n::BIGINT AS explode_steps${h ? ', coalesce(__h, []) AS explode_history' : ''},
+        (__b * ${EXPLODE_MAX} + __i - 1)::BIGINT AS ${ROWCOL} FROM (SELECT *${hist} FROM (${steps})) ORDER BY __b, __i`;
+      const f = `${outBase}.${k}.parquet`; // not "-N.parquet": those are the source shards
+      await c.run(`COPY (${sql}) TO ${q(f)} (FORMAT parquet, ROW_GROUP_SIZE 10000)`);
+      files.push(f);
+    }
+  } catch (e) { files.forEach((f) => fs.rmSync(f, { force: true })); throw oomHint(e); } finally { fs.rmSync(stage, { force: true }); }
+  return { files, rows: total, explode: { column: ref, as, ...(as !== root && { dropped: root }), ...(h && { history: h }), ...(extract.length && { extract: Object.fromEntries(extract) }) } };
 }
 
 // Column profile over the imported rows: type, nulls, distinct values and the top values (text cut at 80 chars).
@@ -484,18 +560,38 @@ function checkRef(st, ref, what) {
   ref = String(ref);
   const names = st.columns.map((c) => c.name);
   if (ref === 'source_row' || names.includes(ref) || names.includes(ref.split(/[.[]/)[0])) return ref;
+  const root = ref.split(/[.[]/)[0];
+  if (st.explode?.dropped === root) throw new Error(`${what}: "${ref}": explode dropped the list column ${root}; keep values from it with explode.extract {name: path} (or give the path in the import's mapping)`);
   throw new Error(`${what}: unknown column "${ref}"`);
 }
-// A column or path (a.b[0].c, source_row) as a DuckDB expression, for value counts and stratify_by.
-function pathSql(st, ref, what) {
+// A column or path (a.b[0].c, source_row) as a DuckDB expression, for value counts, stratify_by, distinct_by and explode.
+// Structs and lists are walked natively; once the path reaches a JSON or text value it continues as JSON, and JSON text
+// nested inside JSON (e.g. tool_calls[0].function.arguments.command) is parsed on the way, as mapping does.
+// Default result is text (JSON strings unwrapped); {raw} keeps JSON values; {list} returns a DuckDB list.
+const jsonStep = (j) => `(CASE WHEN json_type(${j}) = 'VARCHAR' THEN TRY_CAST(json_extract_string(${j}, '$') AS JSON) ELSE ${j} END)`;
+async function pathExpr(c, st, ref, what, { list = false, raw = false } = {}) {
   ref = checkRef(st, ref, what);
   if (ref === 'source_row') return '__row';
-  if (st.columns.some((c) => c.name === ref)) return ident(ref);
-  const toks = [...ref.matchAll(/([^.[\]]+)|\[(\d+|\*)\]/g)].map((m) => m[1] ?? m[2]);
+  const toks = st.columns.some((x) => x.name === ref) ? [ref] : [...ref.matchAll(/([^.[\]]+)|\[(\d+|\*)\]/g)].map((m) => m[1] ?? m[2]);
   if (toks.includes('*')) throw new Error(`${what}: [*] paths are not supported here`);
-  const [root, ...rest] = toks, type = st.columns.find((c) => c.name === root).type;
-  if (/^(JSON|VARCHAR)$/.test(type)) return `json_extract_string(${ident(root)}, ${q('$' + rest.map((t) => (/^\d+$/.test(t) ? `[${t}]` : `.${JSON.stringify(t)}`)).join(''))})`;
-  return rest.reduce((e, t) => (/^\d+$/.test(t) ? `${e}[${+t + 1}]` : `struct_extract(${e}, ${q(t)})`), ident(root));
+  const typeOf = async (e) => (await c.runAndReadAll(`DESCRIBE SELECT ${e} AS x FROM ${st.src} LIMIT 0`)).getRowObjectsJson()[0].column_type;
+  const [root, ...rest] = toks;
+  let e = ident(root), type = st.columns.find((x) => x.name === root).type, json = false;
+  for (const t of rest) {
+    if (!json && /^(JSON|VARCHAR)$/.test(type)) { json = true; e = `TRY_CAST(${e} AS JSON)`; }
+    if (json) { e = `json_extract(${jsonStep(e)}, ${q(/^\d+$/.test(t) ? `$[${t}]` : `$.${JSON.stringify(t)}`)})`; continue; }
+    if (/^\d+$/.test(t)) { if (!/\]$/.test(type)) throw new Error(`${what}: ${ref}: [${t}] on a non-list (${type})`); e = `${e}[${+t + 1}]`; }
+    else { if (!/^STRUCT/.test(type)) throw new Error(`${what}: ${ref}: .${t} on a non-struct (${type})`); e = `struct_extract(${e}, ${q(t)})`; }
+    type = await typeOf(e);
+  }
+  if (list) {
+    if (!json && /^(JSON|VARCHAR)$/.test(type)) { json = true; e = `TRY_CAST(${e} AS JSON)`; }
+    if (json) return `json_extract(${jsonStep(e)}, '$[*]')`;
+    if (!/\]$/.test(type)) throw new Error(`${what}: ${ref} is not a list (${type})`);
+    return e;
+  }
+  if (json) return raw ? e : `json_extract_string(${e}, '$')`;
+  return e;
 }
 function pick(r, ref) {
   if (ref === 'source_row') return r.__row ?? null;
@@ -557,6 +653,7 @@ const numbered = (st) => (st.row_col ? `(SELECT * EXCLUDE (${ROWCOL}), ${ROWCOL}
 const readRows = async (c, sql) => { // JSON-typed columns (mixed-type JSON input) come back as text: parse them
   const r = await c.runAndReadAll(sql);
   const js = r.columnNames().filter((n, i) => r.columnTypes()[i].alias === 'JSON');
+  memoryGuard('read');
   return r.getRowObjectsJS().map((row) => { for (const k of js) if (typeof row[k] === 'string') { try { row[k] = JSON.parse(row[k]); } catch {} } return norm(row); });
 };
 
@@ -568,12 +665,16 @@ export async function preview(id, n = 5, where, o = {}) {
   const order = o.random ? ` ORDER BY hash(__row, ${intOr(o.seed, 42)}), __row` : '';
   const raw = await readRows(c, `SELECT * FROM ${numbered(st)} WHERE ${whereSql(where)}${order} LIMIT ${Math.min(Math.max(intOr(n, 5), 0), 50)} OFFSET ${Math.max(intOr(o.offset, 0), 0)}`);
   const out = { ...summary(st), raw: raw.map(({ __row, ...r }) => r), converted: raw.map((r) => convertRow(r, st)) };
-  if (o.value_counts) out.value_counts = await valueCounts(c, st, typeof o.value_counts === 'string' ? { column: o.value_counts } : o.value_counts);
+  if (o.value_counts) { // counted over rows matching both preview's where and value_counts.where
+    const vc = typeof o.value_counts === 'string' ? { column: o.value_counts } : o.value_counts;
+    out.value_counts = await valueCounts(c, st, { ...vc, where: [where, vc.where] });
+  }
   return out;
 }
 async function valueCounts(c, st, { column, top = 20, where } = {}) {
   if (!column) throw new Error('value_counts needs a column');
-  const e = pathSql(st, column, 'value_counts'), from = `${numbered(st)} WHERE ${whereSql(where)}`;
+  const e = await pathExpr(c, st, column, 'value_counts');
+  const from = `${numbered(st)} WHERE ${[].concat(where ?? []).map(whereSql).join(' AND ') || 'TRUE'}`;
   const [t] = (await c.runAndReadAll(`SELECT count(*)::BIGINT n_rows, count(DISTINCT CAST(${e} AS VARCHAR))::BIGINT n_distinct FROM ${from}`)).getRowObjectsJson();
   const values = (await c.runAndReadAll(`SELECT CAST(${e} AS VARCHAR) AS "value", count(*)::BIGINT AS "count" FROM ${from} GROUP BY 1 ORDER BY 2 DESC, 1 NULLS LAST LIMIT ${Math.min(Math.max(intOr(top, 20), 1), 1000)}`)).getRowObjectsJson();
   return { column, rows: +t.n_rows, distinct_values: +t.n_distinct, values: values.map((x) => ({ value: x.value, count: +x.count })) };
@@ -598,6 +699,8 @@ function normFieldOptions(st, fo) {
   for (const [field, o] of Object.entries(fo || {})) {
     if (!st.schema.fields.some((f) => f.name === field)) throw new Error(`Schema has no field "${field}"`);
     if (o == null) { out[field] = {}; continue; }
+    if (o.duplicates != null && !['skip', 'drop', 'keep'].includes(o.duplicates)) throw new Error(`field_options.${field}.duplicates must be skip, drop or keep`);
+    for (const k of Object.keys(o.value_from?.map || {})) { const re = reKey(k); if (re) try { new RegExp(re[1], re[2]); } catch (e) { throw new Error(`field_options.${field}.value_from.map: bad regex ${k}: ${e.message}`); } }
     if (typeof o !== 'object' || 'name' in o || 'type' in o) throw new Error(`field_options.${field}: an object of field properties (not name/type)`);
     if (o.label_mode != null && !LABEL_MODES.includes(o.label_mode)) throw new Error(`field_options.${field}.label_mode must be one of ${LABEL_MODES}`);
     if (o.gold_from?.column) checkRef(st, o.gold_from.column, `field_options.${field}.gold_from`);
@@ -622,7 +725,15 @@ export async function setMetadata(id, meta = {}, opts = {}) {
   }
   if (opts.schema && opts.schema !== st.schema.name) useSchema(st, opts.schema);
   if (opts.mapping) Object.assign(st.mapping, normMapping(st, opts.mapping));
-  if (opts.field_options) st.field_options = { ...st.field_options, ...normFieldOptions(st, opts.field_options) };
+  // overrides / field_options set here are kept for every later write (per-write ones in convert_and_write apply to that
+  // write only). clear_overrides / clear_field_options: true drops the stored ones first (so clear + new = replace);
+  // a null value drops one field's entry.
+  if (opts.clear_field_options) st.field_options = {};
+  if (opts.field_options) {
+    const n = normFieldOptions(st, Object.fromEntries(Object.entries(opts.field_options).filter(([, v]) => v !== null)));
+    st.field_options = { ...st.field_options, ...n };
+    for (const [k, v] of Object.entries(opts.field_options)) if (v === null) delete st.field_options[k];
+  }
   if (Array.isArray(meta)) st.metadata = mergeMeta(st, [], meta);
   else if (meta && Object.keys(meta).length) st.metadata = mergeMeta(st, st.metadata, meta);
   if (opts.target_column !== undefined) {
@@ -630,7 +741,11 @@ export async function setMetadata(id, meta = {}, opts = {}) {
     if (opts.target_column && (!f || !['json', 'text'].includes(f.type))) throw new Error(`target_column must be a json/text field of schema ${st.schema.name}`);
     st.meta_column = opts.target_column || null;
   }
-  if (opts.overrides) Object.assign(st.overrides, opts.overrides);
+  if (opts.clear_overrides) st.overrides = {};
+  for (const [k, v] of Object.entries(opts.overrides || {})) {
+    if (!st.schema.fields.some((f) => f.name === k)) throw new Error(`overrides: schema ${st.schema.name} has no field "${k}"`);
+    if (v === null) delete st.overrides[k]; else st.overrides[k] = v;
+  }
   return summary(st);
 }
 
@@ -757,6 +872,14 @@ function rng(seed) { // mulberry32
   let a = seed >>> 0;
   return () => { a = (a + 0x6d2b79f5) >>> 0; let t = Math.imul(a ^ (a >>> 15), a | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 }
+// value_from map lookup: exact key, then "/regex/flags" keys in order, then "*", else null.
+const reKey = (k) => k.match(/^\/(.+)\/([a-z]*)$/s);
+function mapValue(m, x) {
+  if (x == null) return Object.hasOwn(m, '*') ? m['*'] : null;
+  if (Object.hasOwn(m, x)) return m[x];
+  for (const k of Object.keys(m)) { const re = reKey(k); if (re && new RegExp(re[1], re[2]).test(x)) return m[k]; }
+  return Object.hasOwn(m, '*') ? m['*'] : null;
+}
 const LATE = ['label_to_option', 'label_to_distribution', 'options_dict']; // need the options field first
 function convertRow(r, st) {
   const row = Number(r.__row ?? 0);
@@ -770,8 +893,7 @@ function convertRow(r, st) {
   const order = [...F.filter((f) => f !== metaField && !LATE.includes(f.transform)), ...LATE.flatMap((t) => F.filter((f) => f !== metaField && f.transform === t)), ...(metaField ? [metaField] : [])];
   const ctxFor = (f, cols) => { // options context for label / distribution / options_dict fields
     const labelField = f.label_field || F.find((g) => g.transform === 'label_to_option' && g.option_field === f.option_field)?.name;
-    const srcCol = (cols[0] || (f.transform !== 'label_to_option' && st.mapping[labelField]?.[0]) || '').split(/[.[]/)[0];
-    const names = st.class_labels?.[srcCol] || null;
+    const names = labelsFor(st, cols[0] || (f.transform !== 'label_to_option' && st.mapping[labelField]?.[0]) || '');
     if (!out[f.option_field]?.length && names) out[f.option_field] = names; // ClassLabel names as options
     const opts = out[f.option_field];
     const optCols = st.mapping[f.option_field] || [];
@@ -789,7 +911,7 @@ function convertRow(r, st) {
     else if (f === metaField) { if (cut.size) Object.assign(meta, { truncated: true, truncated_fields: [...cut] }); v = meta; }
     else if (f.value_from?.column) { // value -> mapped value ("*" = any other value)
       const x = asText(pick(r, f.value_from.column)), m = f.value_from.map;
-      v = !m ? x : x != null && Object.hasOwn(m, x) ? m[x] : Object.hasOwn(m, '*') ? m['*'] : null;
+      v = !m ? x : mapValue(m, x);
     }
     else if (f.transform === 'constant') v = f.value;
     else if (f.transform === 'metadata') v = meta[f.value || f.name];
@@ -807,6 +929,12 @@ function convertRow(r, st) {
         const gv = asText(pick(r, f.gold_from.column)), m = f.gold_from.map ? f.gold_from.map[gv] : gv;
         g = cols.length > 1 && typeof m === 'string' && cols.includes(m) ? cols.indexOf(m) : isNum(m) && Number.isInteger(+m) ? +m : -1;
         if (g >= (items?.length || 0)) g = -1;
+      }
+      if (items?.length && f.duplicates === 'drop') { // drop repeated items (after trim), keeping the gold one
+        const key = (x) => (typeof x === 'string' ? x.trim() : asText(x)), gk = g >= 0 ? key(items[g]) : undefined, seen = new Set();
+        const keepIdx = items.map((x, i) => i).filter((i) => { const k = key(items[i]); if (k === gk ? i !== g : seen.has(k)) return false; seen.add(k); return true; });
+        g = g >= 0 ? keepIdx.indexOf(g) : g;
+        items.splice(0, items.length, ...keepIdx.map((i) => items[i]));
       }
       if (items?.length) {
         const rand = rng(Math.imul((st.seed ?? 42) + 1, 2654435761) ^ row), perm = items.map((_, i) => i);
@@ -840,7 +968,7 @@ function convertRow(r, st) {
     if (!Array.isArray(l)) continue;
     if (!f.allow_empty && l.some((x) => x == null || (typeof x === 'string' && !x.trim()))) out._skipped ||= `empty option in ${f.name}`;
     const t = l.map((x) => (typeof x === 'string' ? x.trim() : asText(x)));
-    if (!f.allow_duplicates && new Set(t).size < t.length) out._skipped ||= `duplicate options in ${f.name}`;
+    if (!f.allow_duplicates && !['keep', 'drop'].includes(f.duplicates) && new Set(t).size < t.length) out._skipped ||= `duplicate options in ${f.name}`;
   }
   // A label that is missing or not an option takes the argmax option of its distribution (e.g. a binned score).
   for (const f of F.filter((x) => x.transform === 'label_to_option' && !(x.name in st.overrides))) {
@@ -850,6 +978,14 @@ function convertRow(r, st) {
     const cur = out[f.name], parsed = (() => { try { return JSON.parse(cur); } catch { return null; } })();
     if (!d || !opts?.length || cur != null && (valid(cur) || Array.isArray(parsed) && parsed.length && parsed.every(valid))) continue;
     out[f.name] = cast(opts[argmax(out[d.name], optionIds(d, opts, explicit[f.option_field]))], f, (n) => cut.add(n));
+  }
+  // skip_unknown (field option) / skip_unknown_labels (write option): a label that is not one of the non-empty options
+  // skips the row (it is refilled) instead of being written with a null or out-of-options target.
+  for (const f of F.filter((x) => x.transform === 'label_to_option' && !(x.name in st.overrides) && (x.skip_unknown ?? st.skip_unknown_labels))) {
+    const opts = (out[f.option_field] || []).filter((x) => x != null && String(x).trim()).map(String);
+    const cur = out[f.name], parsed = (() => { try { return typeof cur === 'string' && cur.startsWith('[') ? JSON.parse(cur) : null; } catch { return null; } })();
+    const vals = Array.isArray(cur) ? cur : Array.isArray(parsed) ? parsed : [cur];
+    if (!vals.length || vals.some((x) => x == null || !opts.includes(String(x)))) out._skipped ||= `unknown label in ${f.name}`;
   }
   return out;
 }
@@ -899,7 +1035,10 @@ const intOr = (v, d) => (Number.isFinite(+v) && v !== '' && v != null ? Math.flo
 // Seeded sample -> convert -> write. Rows are replaced per (dataset_id, write_key).
 // splits: [{tag, n, metadata?, overrides?}] cuts one shuffled sample into disjoint parts, each written with write_key = tag.
 // exclude_dataset_ids / exclude_same_source skip source rows already written to the target table.
-export async function convertAndWrite(id, o = {}) {
+export const convertAndWrite = (id, o = {}) => withCompact(o, () => writeRows(id, o));
+export const copyRows = (o = {}) => withCompact(o, () => copyRowsInner(o));
+export const deleteDataset = (id, o = {}) => withCompact(o, () => deleteInner(id, o));
+async function writeRows(id, o) {
   const { target = 'datasets.duckdb', mode = 'append', cleanup = false, where, exclude_dataset_ids = [], exclude_same_source = false } = o;
   if (!['create', 'append'].includes(mode)) throw new Error('mode must be create or append');
   const exists = fs.existsSync(resolveTarget(target));
@@ -913,12 +1052,17 @@ export async function convertAndWrite(id, o = {}) {
   const baseMeta = o.metadata ? mergeMeta(st, st.metadata, o.metadata) : st.metadata;
   const views = parts.map((p) => ({ ...st, seed, write_key: p.key, metadata: p.metadata ? mergeMeta(st, baseMeta, p.metadata) : baseMeta, overrides: { ...st.overrides, ...o.overrides, ...p.overrides },
     mapping: { ...st.mapping, ...normMapping(st, o.mapping), ...normMapping(st, p.mapping) },
-    field_options: { ...st.field_options, ...normFieldOptions(st, o.field_options), ...normFieldOptions(st, p.field_options) } }));
+    field_options: { ...st.field_options, ...normFieldOptions(st, o.field_options), ...normFieldOptions(st, p.field_options) },
+    skip_unknown_labels: !!o.skip_unknown_labels }));
   const T = `"${st.schema.table}"`, F = st.schema.fields;
   const filter = whereSql(where);
   // check stratify_by / distinct_by / balance before a target file is created
-  for (const [k, v] of [['stratify_by', o.stratify_by], ['distinct_by', o.distinct_by]]) if (v) pathSql(st, v, k);
-  if (o.balance && !st.schema.fields.some((f) => f.name === o.balance)) throw new Error(`balance: schema ${st.schema.name} has no field "${o.balance}"`);
+  if (o.stratify_by && o.balance) throw new Error('use stratify_by (a source column) or balance (a schema field), not both');
+  const c = await memConn();
+  const strat = o.stratify_by ? await pathExpr(c, st, o.stratify_by, 'stratify_by') : o.balance ? await balanceExpr(c, views[0], o.balance) : null;
+  const dist = o.distinct_by ? await pathExpr(c, st, o.distinct_by, 'distinct_by') : null;
+  const perValue = Math.max(1, intOr(o.max_per_value, 1));
+  let P = null; // temp table with the ordered pool
   const tg = await openTarget(target);
   const { conn } = tg;
   try {
@@ -932,57 +1076,40 @@ export async function convertAndWrite(id, o = {}) {
         [`[${ids.map((x) => JSON.stringify(x)).join(',')}]`, !!exclude_same_source, st.source_key, st.schema.table, st.dataset_id, `[${parts.map((p) => JSON.stringify(p.key)).join(',')}]`]))
         .getRowObjectsJson().map((x) => Number(x.r));
     }
-    const c = await memConn();
-    if (o.stratify_by && o.balance) throw new Error('use stratify_by (a source column) or balance (a schema field), not both');
-    const strat = o.stratify_by ? pathSql(st, o.stratify_by, 'stratify_by') : null;
-    const dist = o.distinct_by ? pathSql(st, o.distinct_by, 'distinct_by') : null;
+    // Order of operations: where -> exclude_* -> distinct_by (per stratum when stratify_by/balance is set, up to
+    // max_per_value rows per value) -> stratified interleave (rank 1 of every value, then rank 2, ...) -> seeded order ->
+    // convert, skipping and refilling bad rows -> splits take consecutive rows. All of it runs in DuckDB; JS only
+    // holds one batch of rows at a time.
+    P = `sieve_pool_${process.pid}_${++poolSeq}`;
     let base = `SELECT *${strat ? `, CAST(${strat} AS VARCHAR) AS __stratum` : ''} FROM ${numbered(st)} WHERE ${filter}${excluded.length ? ` AND __row NOT IN (${excluded.join(',')})` : ''}`;
-    // distinct_by: keep one (seeded) row per value; rows where it is null are all kept
-    if (dist) base = `SELECT * EXCLUDE (__d, __dn) FROM (SELECT *, CAST(${dist} AS VARCHAR) AS __d, row_number() OVER (PARTITION BY CAST(${dist} AS VARCHAR) ORDER BY hash(__row, ${seed}), __row) AS __dn FROM (${base})) WHERE __d IS NULL OR __dn = 1`;
-    // stratify_by: rank rows within each value, then take rank 1 of every value, rank 2, ... (values that run out leave room for the rest)
+    if (dist) base = `SELECT * EXCLUDE (__d, __dn) FROM (SELECT *, CAST(${dist} AS VARCHAR) AS __d, row_number() OVER (PARTITION BY ${strat ? '__stratum, ' : ''}CAST(${dist} AS VARCHAR) ORDER BY hash(__row, ${seed}), __row) AS __dn FROM (${base})) WHERE __d IS NULL OR __dn <= ${perValue}`;
     const pool = strat ? `SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY __stratum ORDER BY hash(__row, ${seed}), __row) AS __rank FROM (${base}))` : base;
     const orderBy = strat ? `__rank, hash(__stratum, ${seed}), hash(__row, ${seed}), __row` : `hash(__row, ${seed}), __row`;
-    const poolRows = Number((await c.runAndReadAll(`SELECT count(*) n FROM (${pool})`)).getRowObjectsJson()[0].n);
-    // Seeded, reproducible sample: order by hash(row_number, seed). Rows that are skipped (missing a required field,
-    // gold tie) are replaced by the next rows of the order, so each part gets n rows while the pool lasts.
+    // The ordered pool is kept as keys only (row, stratum, position); batches of <= 1000 rows are read back by key.
+    await c.run(`CREATE TEMP TABLE ${P} AS SELECT __row${strat ? ', __stratum' : ''}, row_number() OVER (ORDER BY ${orderBy}) AS __ord FROM (${pool})`);
+    const poolRows = Number((await c.runAndReadAll(`SELECT count(*) n FROM ${P}`)).getRowObjectsJson()[0].n);
     const want = parts.reduce((a, p) => a + p.n, 0);
     let buf = [], off = 0, done = false;
     const next = async () => {
       if (!buf.length && !done) {
-        const b = Math.max(want - off, 0) + 200;
-        buf = await readRows(c, `${pool} ORDER BY ${orderBy} LIMIT ${b} OFFSET ${off}`);
+        const b = Math.min(Math.max(want - off, 0) + 200, 1000);
+        buf = await readRows(c, `SELECT s.*${strat ? ', p.__stratum' : ''} FROM (SELECT * FROM ${P} WHERE __ord > ${off} AND __ord <= ${off + b}) p JOIN ${numbered(st)} s USING (__row) ORDER BY p.__ord`);
         off += buf.length; done = buf.length < b;
       }
       return buf.shift();
     };
     const req = F.filter((f) => f.required).map((f) => f.name);
     const bad = (x) => x._skipped || !req.every((k) => x[k] != null);
-    // balance: a schema field (e.g. the mapped label). The whole pool is converted, grouped by that field's value and
-    // interleaved like stratify_by (one row per value, then a second, ...); each split takes the next rows.
-    let ready = null, poolSkipped = 0;
-    if (o.balance) {
-      if (!F.some((f) => f.name === o.balance)) throw new Error(`balance: schema ${st.schema.name} has no field "${o.balance}"`);
-      const all = await readRows(c, `${pool} ORDER BY ${orderBy}`), groups = new Map();
-      for (const r of all) {
-        const x = convertRow(r, views[0]);
-        if (bad(x)) { poolSkipped++; continue; }
-        const k = asText(x[o.balance]) ?? 'null';
-        if (!groups.has(k)) groups.set(k, []);
-        groups.get(k).push(r);
-      }
-      const keys = seededShuffle([...groups.keys()].sort(), seed);
-      ready = [];
-      for (let i = 0; ready.length < all.length - poolSkipped; i++) for (const k of keys) { const g = groups.get(k); if (i < g.length) ready.push({ ...g[i], __stratum: k }); }
-    }
-    const nextRow = ready ? async () => ready.shift() : next;
-    const written = [], skipped = [], strata = [];
+    const nextRow = next;
+    const written = [], skipped = [], strata = [], reasons = {};
     for (const [i, v] of views.entries()) {
-      const rows = [], per = {}; let sk = 0;
+      const rows = [], per = {}; let sk = 0, seen = 0;
       while (rows.length < parts[i].n) {
         const r = await nextRow(); if (!r) break;
+        if (++seen % 1000 === 0) memoryGuard('write');
         const { __stratum, __rank, ...src } = r;
         const x = convertRow(src, v);
-        if (bad(x)) sk++; else { rows.push(x); if (strat || ready) per[__stratum ?? 'null'] = (per[__stratum ?? 'null'] || 0) + 1; }
+        if (bad(x)) { sk++; const why = x._skipped || 'missing required field'; reasons[why] = (reasons[why] || 0) + 1; } else { rows.push(x); if (strat) per[__stratum ?? 'null'] = (per[__stratum ?? 'null'] || 0) + 1; }
       }
       written.push(rows); skipped.push(sk); strata.push(per);
     }
@@ -1004,24 +1131,80 @@ export async function convertAndWrite(id, o = {}) {
           st.source_key, st.format, st.row_count, written[i].length, seed, where ? String(where) : null, JSON.stringify({ mapping: v.mapping, overrides: v.overrides, field_options: v.field_options })]);
     }
     await conn.run('COMMIT');
+    await c.run(`DROP TABLE IF EXISTS ${P}`);
     const total = Number((await conn.runAndReadAll(`SELECT count(*) n FROM ${T}`)).getRowObjectsJson()[0].n);
     const cleaned = cleanup ? await cleanupDownloads(st.dataset_id) : undefined;
     const rows_written = written.reduce((a, w) => a + w.length, 0);
     return { ...(cleaned && { cleanup: cleaned }), mode, dataset_id: st.dataset_id, schema: st.schema.name, table: st.schema.table, target: displayName(tg.tpath), rows_written, total_rows_in_target: total, seed,
       pool_rows: poolRows, ...(excluded.length && { excluded_rows: excluded.length }),
-      ...(skipped.some(Boolean) && { rows_skipped: skipped.reduce((a, b) => a + b, 0) }),
-      ...((strat || ready) && { [ready ? 'balance' : 'stratify_by']: o.balance || o.stratify_by, strata_values: Object.keys(allStrata).length, strata: top(allStrata) }),
-      ...(poolSkipped && { pool_rows_skipped: poolSkipped }), ...(dist && { distinct_by: o.distinct_by }),
-      ...(o.splits?.length ? { splits: parts.map((p, i) => ({ tag: p.key, requested: p.n, rows_written: written[i].length, ...(skipped[i] && { rows_skipped: skipped[i] }), ...((strat || ready) && { strata: top(strata[i]) }) })) } : { write_key: parts[0].key }) };
+      ...(skipped.some(Boolean) && { rows_skipped: skipped.reduce((a, b) => a + b, 0), skip_reasons: top(reasons) }),
+      ...(strat && { [o.balance ? 'balance' : 'stratify_by']: o.balance || o.stratify_by, strata_values: Object.keys(allStrata).length, strata: top(allStrata) }),
+      ...(dist && { distinct_by: o.distinct_by, max_per_value: perValue }),
+      ...(o.splits?.length ? { splits: parts.map((p, i) => ({ tag: p.key, requested: p.n, rows_written: written[i].length, ...(skipped[i] && { rows_skipped: skipped[i] }), ...(strat && { strata: top(strata[i]) }) })) } : { write_key: parts[0].key }) };
   } catch (e) {
     await conn.run('ROLLBACK').catch(() => {});
-    throw e;
+    if (P) await c.run(`DROP TABLE IF EXISTS ${P}`).catch(() => {});
+    throw oomHint(e);
   } finally { tg.close(); }
+}
+
+let poolSeq = 0;
+
+// compact: rewrite a target file without the space left by deleted/replaced rows. The file is checkpointed, copied
+// table by table into a new file (COPY FROM DATABASE) and swapped in. Also run by compact: true on writes/copies/deletes.
+export async function compactTarget(target = 'datasets.duckdb') {
+  const p = resolveTarget(target);
+  if (!fs.existsSync(p)) throw new Error(`${displayName(p)} does not exist`);
+  const size = () => [p, `${p}.wal`].reduce((a, f) => a + (fs.existsSync(f) ? fs.statSync(f).size : 0), 0);
+  const before = size(), tmp = `${p}.compact-${process.pid}`;
+  for (const f of [tmp, `${tmp}.wal`]) fs.rmSync(f, { force: true });
+  const inst = await DuckDBInstance.create(':memory:', { temp_directory: path.join(DATA_DIR, '.tmp') }), conn = await inst.connect();
+  try {
+    await conn.run(`ATTACH ${q(p)} AS sieve_old`); await conn.run('CHECKPOINT sieve_old'); await conn.run('DETACH sieve_old');
+    await conn.run(`ATTACH ${q(p)} AS sieve_old (READ_ONLY)`);
+    await conn.run(`ATTACH ${q(tmp)} AS sieve_new`);
+    await conn.run('COPY FROM DATABASE sieve_old TO sieve_new');
+    await conn.run('DETACH sieve_old'); await conn.run('CHECKPOINT sieve_new'); await conn.run('DETACH sieve_new');
+  } catch (e) { for (const f of [tmp, `${tmp}.wal`]) fs.rmSync(f, { force: true }); throw e; } finally { conn.closeSync?.(); inst.closeSync?.(); }
+  fs.rmSync(`${tmp}.wal`, { force: true });
+  fs.renameSync(tmp, p); fs.rmSync(`${p}.wal`, { force: true });
+  const after = size();
+  return { target: displayName(p), bytes_before: before, bytes_after: after, bytes_saved: before - after };
+}
+async function withCompact(o, fn) {
+  if (o.compact != null && typeof o.compact !== 'boolean') throw new Error('compact must be true or false');
+  const r = await fn();
+  return o.compact ? { ...r, compact: await compactTarget(o.target || 'datasets.duckdb') } : r;
+}
+
+// balance: the field's value as SQL, so balancing is stratification in DuckDB. Supported: value_from (the map as a
+// CASE, regex keys included) or a field mapped to source columns (first non-null). Fixed/derived fields can't be balanced.
+async function balanceExpr(c, v, field) {
+  const f = v.schema.fields.find((x) => x.name === field);
+  if (!f) throw new Error(`balance: schema ${v.schema.name} has no field "${field}"`);
+  if (field in v.overrides) throw new Error(`balance: ${field} is an override (one value)`);
+  const fo = { ...f, ...v.field_options?.[field] };
+  if (fo.value_from?.column) {
+    const x = `CAST(${await pathExpr(c, v, fo.value_from.column, 'balance')} AS VARCHAR)`, m = fo.value_from.map;
+    if (!m) return x;
+    const lit = (y) => (y == null ? 'NULL' : q(typeof y === 'string' ? y : JSON.stringify(y)));
+    const keys = Object.keys(m).filter((k) => k !== '*');
+    const exact = keys.filter((k) => !reKey(k)), res = keys.filter((k) => reKey(k));
+    const whens = [...exact.map((k) => `WHEN ${x} = ${q(k)} THEN ${lit(m[k])}`),
+      ...res.map((k) => { const [, p, fl] = reKey(k), opt = fl.replace(/[^imsx]/g, ''); return `WHEN regexp_matches(${x}, ${q(p)}${opt ? `, ${q(opt)}` : ''}) THEN ${lit(m[k])}`; })];
+    const star = lit(m['*'] ?? null);
+    return whens.length ? `(CASE WHEN ${x} IS NULL THEN ${star} ${whens.join(' ')} ELSE ${star} END)` : star;
+  }
+  const cols = v.mapping[field] || [];
+  if (!cols.length) throw new Error(`balance: ${field} is not mapped to a source column (map it, give it value_from, or use stratify_by)`);
+  const es = [];
+  for (const col of cols) es.push(`CAST(${await pathExpr(c, v, col, 'balance')} AS VARCHAR)`);
+  return es.length > 1 ? `coalesce(${es.join(', ')})` : es[0];
 }
 
 // Copy written rows from one target file to another (rows keep id, source_row, meta, write_key, created_at), with their
 // datasets records. where filters the source table; n takes a seeded sample. Rows with the same id are replaced.
-export async function copyRows({ source_target, table, target, where, n, seed = 42 } = {}) {
+async function copyRowsInner({ source_target, table, target, where, n, seed = 42 } = {}) {
   if (!source_target || !target) throw new Error('copy_rows needs source_target and target');
   const sp = resolveTarget(source_target);
   if (!fs.existsSync(sp)) throw new Error(`${displayName(sp)} does not exist`);
@@ -1062,7 +1245,7 @@ export async function copyRows({ source_target, table, target, where, n, seed = 
 }
 
 // Remove a dataset's rows (all write_keys, or one) and its datasets records from a target file.
-export async function deleteDataset(id, { target = 'datasets.duckdb', write_key } = {}) {
+async function deleteInner(id, { target = 'datasets.duckdb', write_key } = {}) {
   if (!fs.existsSync(resolveTarget(target))) throw new Error(`${displayName(resolveTarget(target))} does not exist`);
   const tg = await openTarget(target);
   try {
@@ -1088,7 +1271,7 @@ export async function deleteDataset(id, { target = 'datasets.duckdb', write_key 
 // One shot: HF name/URL + schema -> download, auto-map, sample, write.
 export async function runPipeline({ url, schema = 'default', config, split, format, table, limit, fetch, columns, fetch_seed, row_groups, max_rows_per_group, explode, metadata, target_column, mapping, overrides, field_options, target, mode, ...write }) {
   const imp = await importDataset(url, { schema, config, split, format, table, limit, fetch, columns, seed: fetch_seed, row_groups, max_rows_per_group, explode, mapping, metadata, where: write.where, splits: write.splits, field_options });
-  await setMetadata(imp.dataset_id, metadata, { mapping, overrides, target_column, field_options });
-  const res = await convertAndWrite(imp.dataset_id, { ...write, target, mode: mode || (fs.existsSync(resolveTarget(target)) ? 'append' : 'create') });
+  await setMetadata(imp.dataset_id, metadata, { mapping, target_column, field_options });
+  const res = await convertAndWrite(imp.dataset_id, { ...write, overrides, target, mode: mode || (fs.existsSync(resolveTarget(target)) ? 'append' : 'create') });
   return { ...res, download_bytes: imp.download_bytes, hf: imp.hf, mapping: datasets.get(imp.dataset_id).mapping };
 }

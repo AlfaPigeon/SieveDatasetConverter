@@ -6,3 +6,4 @@ data/
 *.csv
 *.jsonl
 .env
+.tmp/
