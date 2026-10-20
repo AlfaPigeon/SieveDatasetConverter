@@ -19,7 +19,7 @@ app.get('/api/hf/splits', h((r) => core.hfSplits(r.query.dataset)));
 app.get('/api/targets', h(() => core.listTargets()));
 app.post('/api/run', h((r) => core.runPipeline(r.body)));
 app.post('/api/import', h((r) => { const { url, ...o } = r.body; return core.importDataset(url, o); }));
-app.get('/api/datasets/:id/preview', h((r) => core.preview(r.params.id, r.query.n, r.query.where)));
+app.get('/api/datasets/:id/preview', h((r) => core.preview(r.params.id, r.query.n, r.query.where, { offset: r.query.offset, random: r.query.random === 'true', seed: r.query.seed, ...(r.query.value_counts && { value_counts: { column: r.query.value_counts, top: r.query.top } }) })));
 app.post('/api/datasets/:id/metadata', h((r) => { const { metadata, ...o } = r.body; return core.setMetadata(r.params.id, metadata, o); }));
 app.post('/api/downloads/cleanup', h((r) => core.cleanupDownloads(r.body?.dataset_id)));
 app.post('/api/datasets/:id/convert', h((r) => core.convertAndWrite(r.params.id, r.body)));

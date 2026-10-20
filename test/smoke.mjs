@@ -106,5 +106,33 @@ assert.ok(rows5.some((x) => x.d.startsWith('{"b"')));
 const w6 = await core.convertAndWrite(d5.dataset_id, { target: 'p', write_key: 'first', sample: 30, field_options: { options: { gold_from: { argmax_of: ['s1', 's2', 's3'], ties: 'first' } } } });
 assert.equal(w6.rows_written, 30); assert.equal(w6.rows_skipped, undefined);
 
+// preview: offset, random sample, value_counts (column or path, top, where)
+const pv = await core.preview(d.dataset_id, 3, null, { offset: 10 });
+assert.deepEqual(pv.converted.map((x) => x.source_row), [10, 11, 12]);
+const pr = await core.preview(d.dataset_id, 5, null, { random: true, seed: 1 });
+assert.notDeepEqual(pr.converted.map((x) => x.source_row), [0, 1, 2, 3, 4]);
+assert.deepEqual(pr, await core.preview(d.dataset_id, 5, null, { random: true, seed: 1 }));
+const vc = await core.preview(d.dataset_id, 0, null, { value_counts: { column: 'answer' } });
+assert.equal(vc.converted.length, 0);
+assert.deepEqual(vc.value_counts, { column: 'answer', rows: 200, distinct_values: 3, values: [{ value: 'A', count: 67 }, { value: 'B', count: 67 }, { value: 'C', count: 66 }] });
+const vp = (await core.preview(d.dataset_id, 0, null, { value_counts: { column: 'choices.label[2]', top: 1, where: "answer = 'A'" } })).value_counts;
+assert.deepEqual(vp.values, [{ value: 'C', count: 67 }]);
+
+// empty / whitespace option text: the row is skipped and refilled; allow_empty keeps it
+const src7 = path.join(dir, 'src7.jsonl');
+fs.writeFileSync(src7, Array.from({ length: 40 }, (_, i) => JSON.stringify({ q: `q${i}`, opts: i % 4 ? ['x', 'y'] : ['x', '  '], ans: 0, grp: i < 30 ? 'big' : i < 37 ? 'mid' : 'small' })).join('\n'));
+const d7 = await core.importDataset(src7, { limit: 'all', mapping: { input: ['q'], options: ['opts'], label: ['ans'] } });
+assert.equal((await core.preview(d7.dataset_id, 1)).converted[0]._skipped, 'empty option in options');
+const w7 = await core.convertAndWrite(d7.dataset_id, { target: 'e', mode: 'create', sample: 20 });
+assert.equal(w7.rows_written, 20); assert.ok(w7.rows_skipped > 0);
+const w8 = await core.convertAndWrite(d7.dataset_id, { target: 'e', write_key: 'all', sample: 40, field_options: { options: { allow_empty: true } } });
+assert.equal(w8.rows_written, 40);
+
+// stratify_by: even spread over values, top-up when a value runs short, per split counts
+const w9 = await core.convertAndWrite(d7.dataset_id, { target: 'e', field_options: { options: { allow_empty: true } }, stratify_by: 'grp',
+  splits: [{ tag: 's1', n: 9 }, { tag: 's2', n: 12 }] });
+assert.deepEqual(w9.splits[0].strata, { big: 3, mid: 3, small: 3 });
+assert.deepEqual(w9.strata, { big: 11, mid: 7, small: 3 }); // small has 3 rows, mid 7: the rest is topped up from big
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log('smoke test passed');

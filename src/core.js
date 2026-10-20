@@ -69,7 +69,7 @@ const hfApi = (endpoint, repo) => hfFetch(repo, `https://datasets-server.hugging
 export async function hfSplits(name) {
   const repo = parseHf(String(name).trim());
   if (!repo) throw new Error('Not a Hugging Face dataset name');
-  const [sp, info] = await Promise.all([hfApi('splits', repo), hfApi('size', repo).catch(() => null)]);
+  const [sp, info] = await withAccess(repo, () => Promise.all([hfApi('splits', repo), hfApi('size', repo).catch(() => null)]));
   const rows = new Map((info?.size?.splits || []).map((x) => [`${x.config}/${x.split}`, x.num_rows]));
   return { dataset: repo, splits: sp.splits.map(({ config, split }) => ({ config, split, rows: rows.get(`${config}/${split}`) ?? null })) };
 }
@@ -78,14 +78,25 @@ export async function hfSplits(name) {
 // HF auth-check first: a gated repo without access fails here the same way whatever config/split was asked
 // (the datasets-server answers 404 for some and file reads 403 for others).
 async function hfAccess(repo) {
-  let r; try { r = await fetch(`https://huggingface.co/api/datasets/${repo}/auth-check`, { headers: hfHeaders() }); } catch { return; }
-  if (r.ok) return;
+  let r; try { r = await fetch(`https://huggingface.co/api/datasets/${repo}/auth-check`, { headers: hfHeaders() }); } catch { return false; }
+  if (r.ok) return true;
   const t = await r.text().catch(() => ''); let m = t; try { m = JSON.parse(t).error || t; } catch {}
-  if (r.status === 401 || r.status === 403) throw hfError(repo, r.status, String(m));
-  if (r.status === 404) throw Object.assign(new Error(`${repo} was not found on Hugging Face (or it is private and HF_TOKEN has no access${process.env.HF_TOKEN ? '' : '; HF_TOKEN is not set'}).`), { kind: 'gated' });
+  if (r.status === 401 || r.status === 403) throw Object.assign(hfError(repo, r.status, String(m)), { access: true, status: r.status });
+  if (r.status === 404) throw Object.assign(new Error(`${repo} was not found on Hugging Face (or it is private and HF_TOKEN has no access${process.env.HF_TOKEN ? '' : '; HF_TOKEN is not set'}).`), { kind: 'gated', access: true, status: 404 });
+}
+// Run an HF call after the access check. A "private or gated" answer from the datasets-server after access
+// passed means the dataset has no viewer data, not missing access.
+async function withAccess(repo, fn) {
+  const checked = await hfAccess(repo);
+  try { return await fn(); } catch (e) {
+    if (checked && e.kind === 'gated' && !e.access) throw Object.assign(new Error(`Hugging Face has no viewer/Parquet data for ${repo} (${String(e.message).slice(0, 160)})`), { kind: 'other' });
+    throw e;
+  }
 }
 async function hfShards(repo, opts = {}) {
-  await hfAccess(repo);
+  return withAccess(repo, () => hfShardsAny(repo, opts));
+}
+async function hfShardsAny(repo, opts = {}) {
   try { return await hfShardsApi(repo, opts); } catch (e) {
     try { return await hfShardsHub(repo, opts); } catch (e2) {
       throw e2.kind === 'gated' || e.kind === 'other' && e2.kind !== 'other' ? e2 : e;
@@ -165,20 +176,31 @@ async function fetchHfRemote(c, repo, urls, limit, id, { fetch: mode = 'random',
   await ensureHttpfs(c);
   await c.run('CALL truncate_duckdb_logs()').catch(() => {});
   try { return await fetchHfRemoteInner(c, repo, urls, limit, id, { mode, seed, columns, row_groups, max_rows_per_group, info }); } finally {
-    if (info) info.network_bytes = await c.runAndReadAll(`SELECT coalesce(sum(TRY_CAST(response.headers['content-length'] AS BIGINT)), 0)::BIGINT n
-      FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'GET'`).then((r) => Number(r.getRowObjectsJson()[0].n)).catch(() => undefined);
+    if (info) {
+      info.network_bytes = await c.runAndReadAll(`SELECT coalesce(sum(TRY_CAST(response.headers['content-length'] AS BIGINT)), 0)::BIGINT n
+        FROM duckdb_logs_parsed('HTTP') WHERE request.type = 'GET'`).then((r) => Number(r.getRowObjectsJson()[0].n)).catch(() => undefined);
+      // DuckDB keeps remote blocks in memory, so a re-import in the same process downloads little or nothing:
+      // data_bytes = compressed column chunks the read needed (Parquet metadata), cached_bytes = the part not downloaded.
+      if (info.data_bytes != null && info.network_bytes != null) info.cached_bytes = Math.max(0, info.data_bytes - info.network_bytes);
+    }
   }
 }
 async function fetchHfRemoteInner(c, repo, urls, limit, id, { mode, seed, columns, row_groups, max_rows_per_group, info }) {
   const proj = columns?.length ? columns.map(ident).join(', ') : '* EXCLUDE (file_row_number)';
   const sel = (u, i, cond = '') => `SELECT ${proj}, file_row_number + ${i * SHARD} AS ${ROWCOL} FROM read_parquet(${q(u)}, file_row_number=true)${cond}`;
   const files = []; let have = 0;
+  // row groups of a shard: rows and compressed bytes of the fetched columns
+  const groupsOf = async (u) => (await c.runAndReadAll(`SELECT row_group_id g, max(row_group_num_rows) n,
+      sum(total_compressed_size) FILTER (WHERE ${columns?.length ? `split_part(path_in_schema, ', ', 1) IN (${columns.map(q).join(', ')})` : 'TRUE'})::BIGINT bytes
+      FROM parquet_metadata(${q(u)}) GROUP BY 1 ORDER BY 1`)).getRowObjectsJson().map((g) => ({ n: +g.n, bytes: +g.bytes || 0 }));
+  if (info) info.data_bytes = 0;
   try {
     if (mode === 'head') {
       for (const [i, u] of urls.entries()) {
         const f = path.join(DL_DIR, `${id}-${i}.parquet`);
         await c.run(`COPY (${sel(u, i)} LIMIT ${limit - have}) TO ${q(f)} (FORMAT parquet)`);
-        files.push(f); have += await countRows(c, f);
+        files.push(f); const got = await countRows(c, f); have += got;
+        if (info) { let r = 0; for (const g of await groupsOf(u)) { if (r >= got) break; r += g.n; info.data_bytes += g.bytes; } }
         if (have >= limit) break;
       }
       return files;
@@ -187,8 +209,7 @@ async function fetchHfRemoteInner(c, repo, urls, limit, id, { mode, seed, column
     const groups = [];
     for (const { u, i } of shards) {
       let start = 0;
-      for (const g of (await c.runAndReadAll(`SELECT row_group_id g, max(row_group_num_rows) n FROM parquet_metadata(${q(u)}) GROUP BY 1 ORDER BY 1`)).getRowObjectsJson())
-        groups.push({ u, i, start: (start += +g.n) - +g.n, n: +g.n });
+      for (const g of await groupsOf(u)) groups.push({ u, i, start: (start += g.n) - g.n, n: g.n, bytes: g.bytes });
     }
     const G = Math.min(groups.length, Math.max(1, row_groups > 0 ? +row_groups : Math.ceil(limit / (max_rows_per_group > 0 ? +max_rows_per_group : Math.ceil(limit / 16)))));
     const per = Math.ceil(limit / G);
@@ -200,7 +221,7 @@ async function fetchHfRemoteInner(c, repo, urls, limit, id, { mode, seed, column
       const rows = n >= g.n ? null : seededShuffle(Array.from({ length: g.n }, (_, j) => g.start + j), seed + 2 + k).slice(0, n).sort((a, b) => a - b);
       take.push({ ...g, size: g.n, n, rows }); have += n;
     }
-    if (info) info.row_groups = take.length;
+    if (info) { info.row_groups = take.length; info.data_bytes = take.reduce((a, g) => a + g.bytes, 0); }
     for (const i of [...new Set(take.map((g) => g.i))].sort((a, b) => a - b)) {
       const parts = take.filter((g) => g.i === i).sort((a, b) => a.start - b.start)
         .map((g) => `(${sel(g.u, i, ` WHERE file_row_number BETWEEN ${g.start} AND ${g.start + g.size - 1}${g.rows ? ` AND file_row_number IN (${g.rows.join(',')})` : ''}`)})`);
@@ -335,7 +356,7 @@ export async function importDataset(url, opts = {}) {
         hf.errors = [...(hf.errors || []), `${via}: ${String(e.message || e).slice(0, 200)}`];
       }
     }
-    if (hf.via === 'httpfs') Object.assign(hf, { fetch: fetchOpts.fetch, ...(fetchOpts.fetch === 'random' && { seed: fetchOpts.seed, row_groups: fetchOpts.info.row_groups }), network_bytes: fetchOpts.info.network_bytes, ...(columns && { columns }) });
+    if (hf.via === 'httpfs') Object.assign(hf, { fetch: fetchOpts.fetch, ...(fetchOpts.fetch === 'random' && { seed: fetchOpts.seed, row_groups: fetchOpts.info.row_groups }), network_bytes: fetchOpts.info.network_bytes, data_bytes: fetchOpts.info.data_bytes, cached_bytes: fetchOpts.info.cached_bytes, ...(columns && { columns }) });
     features = hf.features || await parquetFeatures(c, files[0]) || (hf.via === 'httpfs' && await parquetFeatures(c, hf.urls[0]));
     hf.shards = `${new Set(files.map((f) => f.match(/-(\d+)\.parquet$/)[1])).size}/${hf.urls.length}`;
     origin = { repo, config: hf.config, split: hf.split, url: `https://huggingface.co/datasets/${repo}`, limit };
@@ -378,7 +399,7 @@ export async function importDataset(url, opts = {}) {
   const st = {
     dataset_id: id, url, src, row_col: rowCol, limit, tables, table, format, columns: cols, row_count: rowCount, origin,
     source_key: origin ? `hf:${origin.repo}/${origin.config}/${origin.split}` : `${format}:${url}${table ? `#${table}` : ''}`,
-    hf: hf && { repo, config: hf.config, split: hf.split, shards: hf.shards, via: hf.via, ...(hf.fetch && { fetch: hf.fetch }), ...(hf.seed != null && { seed: hf.seed }), ...(hf.row_groups && { row_groups: hf.row_groups }), ...(hf.network_bytes != null && { network_bytes: hf.network_bytes }), ...(hf.columns && { columns: hf.columns }), ...(hf.listing && { listing: hf.listing }), ...(hf.errors && { fallback_errors: hf.errors }) },
+    hf: hf && { repo, config: hf.config, split: hf.split, shards: hf.shards, via: hf.via, ...(hf.fetch && { fetch: hf.fetch }), ...(hf.seed != null && { seed: hf.seed }), ...(hf.row_groups && { row_groups: hf.row_groups }), ...(hf.network_bytes != null && { network_bytes: hf.network_bytes, data_bytes: hf.data_bytes, cached_bytes: hf.cached_bytes }), ...(hf.columns && { columns: hf.columns }), ...(hf.listing && { listing: hf.listing }), ...(hf.errors && { fallback_errors: hf.errors }) },
     files, download_bytes: bytesOf(files), class_labels: classLabels(features),
     metadata: [{ key: 'name', value: name }, { key: 'domain', value: 'general' }, { key: 'source', value: url }],
     meta_column: null, field_options: {},
@@ -418,6 +439,17 @@ function checkRef(st, ref, what) {
   const names = st.columns.map((c) => c.name);
   if (ref === 'source_row' || names.includes(ref) || names.includes(ref.split(/[.[]/)[0])) return ref;
   throw new Error(`${what}: unknown column "${ref}"`);
+}
+// A column or path (a.b[0].c, source_row) as a DuckDB expression, for value counts and stratify_by.
+function pathSql(st, ref, what) {
+  ref = checkRef(st, ref, what);
+  if (ref === 'source_row') return '__row';
+  if (st.columns.some((c) => c.name === ref)) return ident(ref);
+  const toks = [...ref.matchAll(/([^.[\]]+)|\[(\d+|\*)\]/g)].map((m) => m[1] ?? m[2]);
+  if (toks.includes('*')) throw new Error(`${what}: [*] paths are not supported here`);
+  const [root, ...rest] = toks, type = st.columns.find((c) => c.name === root).type;
+  if (/^(JSON|VARCHAR)$/.test(type)) return `json_extract_string(${ident(root)}, ${q('$' + rest.map((t) => (/^\d+$/.test(t) ? `[${t}]` : `.${JSON.stringify(t)}`)).join(''))})`;
+  return rest.reduce((e, t) => (/^\d+$/.test(t) ? `${e}[${+t + 1}]` : `struct_extract(${e}, ${q(t)})`), ident(root));
 }
 function pick(r, ref) {
   if (ref === 'source_row') return r.__row ?? null;
@@ -482,11 +514,23 @@ const readRows = async (c, sql) => { // JSON-typed columns (mixed-type JSON inpu
   return r.getRowObjectsJS().map((row) => { for (const k of js) if (typeof row[k] === 'string') { try { row[k] = JSON.parse(row[k]); } catch {} } return norm(row); });
 };
 
-export async function preview(id, n = 5, where) {
+// preview: n rows (max 50) from `offset`, or a seeded random sample (random: true); value_counts: {column, top?, where?}
+// counts values of a column/path over all imported rows (top 20 by default).
+export async function preview(id, n = 5, where, o = {}) {
   const st = get(id);
   const c = await memConn();
-  const raw = await readRows(c, `SELECT * FROM ${numbered(st)} WHERE ${whereSql(where)} LIMIT ${Math.min(+n || 5, 50)}`);
-  return { ...summary(st), raw: raw.map(({ __row, ...r }) => r), converted: raw.map((r) => convertRow(r, st)) };
+  const order = o.random ? ` ORDER BY hash(__row, ${intOr(o.seed, 42)}), __row` : '';
+  const raw = await readRows(c, `SELECT * FROM ${numbered(st)} WHERE ${whereSql(where)}${order} LIMIT ${Math.min(Math.max(intOr(n, 5), 0), 50)} OFFSET ${Math.max(intOr(o.offset, 0), 0)}`);
+  const out = { ...summary(st), raw: raw.map(({ __row, ...r }) => r), converted: raw.map((r) => convertRow(r, st)) };
+  if (o.value_counts) out.value_counts = await valueCounts(c, st, typeof o.value_counts === 'string' ? { column: o.value_counts } : o.value_counts);
+  return out;
+}
+async function valueCounts(c, st, { column, top = 20, where } = {}) {
+  if (!column) throw new Error('value_counts needs a column');
+  const e = pathSql(st, column, 'value_counts'), from = `${numbered(st)} WHERE ${whereSql(where)}`;
+  const [t] = (await c.runAndReadAll(`SELECT count(*)::BIGINT n_rows, count(DISTINCT CAST(${e} AS VARCHAR))::BIGINT n_distinct FROM ${from}`)).getRowObjectsJson();
+  const values = (await c.runAndReadAll(`SELECT CAST(${e} AS VARCHAR) AS "value", count(*)::BIGINT AS "count" FROM ${from} GROUP BY 1 ORDER BY 2 DESC, 1 NULLS LAST LIMIT ${Math.min(Math.max(intOr(top, 20), 1), 1000)}`)).getRowObjectsJson();
+  return { column, rows: +t.n_rows, distinct_values: +t.n_distinct, values: values.map((x) => ({ value: x.value, count: +x.count })) };
 }
 
 function normMapping(st, mapping) {
@@ -737,6 +781,9 @@ function convertRow(r, st) {
     if (f.enum && v != null && !f.enum.includes(v)) throw new Error(`field ${f.name}: "${v}" not in ${f.enum}`);
     out[f.name] = v;
   }
+  // Options / shuffle items that are empty or whitespace-only count as missing: the row is skipped (allow_empty: true keeps it).
+  for (const f of F.filter((x) => (x.transform === 'shuffle' || optionFields.has(x.name)) && !x.allow_empty && !(x.name in st.overrides)))
+    if (Array.isArray(out[f.name]) && out[f.name].some((x) => x == null || (typeof x === 'string' && !x.trim()))) out._skipped ||= `empty option in ${f.name}`;
   // A label that is missing or not an option takes the argmax option of its distribution (e.g. a binned score).
   for (const f of F.filter((x) => x.transform === 'label_to_option' && !(x.name in st.overrides))) {
     const d = F.find((g) => g.transform === 'label_to_distribution' && g.option_field === f.option_field && out[g.name]);
@@ -825,7 +872,11 @@ export async function convertAndWrite(id, o = {}) {
         .getRowObjectsJson().map((x) => Number(x.r));
     }
     const c = await memConn();
-    const pool = `SELECT * FROM ${numbered(st)} WHERE ${filter}${excluded.length ? ` AND __row NOT IN (${excluded.join(',')})` : ''}`;
+    const strat = o.stratify_by ? pathSql(st, o.stratify_by, 'stratify_by') : null;
+    const base = `SELECT *${strat ? `, CAST(${strat} AS VARCHAR) AS __stratum` : ''} FROM ${numbered(st)} WHERE ${filter}${excluded.length ? ` AND __row NOT IN (${excluded.join(',')})` : ''}`;
+    // stratify_by: rank rows within each value, then take rank 1 of every value, rank 2, ... (values that run out leave room for the rest)
+    const pool = strat ? `SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY __stratum ORDER BY hash(__row, ${seed}), __row) AS __rank FROM (${base}))` : base;
+    const orderBy = strat ? `__rank, hash(__stratum, ${seed}), hash(__row, ${seed}), __row` : `hash(__row, ${seed}), __row`;
     const poolRows = Number((await c.runAndReadAll(`SELECT count(*) n FROM (${pool})`)).getRowObjectsJson()[0].n);
     // Seeded, reproducible sample: order by hash(row_number, seed). Rows that are skipped (missing a required field,
     // gold tie) are replaced by the next rows of the order, so each part gets n rows while the pool lasts.
@@ -834,22 +885,25 @@ export async function convertAndWrite(id, o = {}) {
     const next = async () => {
       if (!buf.length && !done) {
         const b = Math.max(want - off, 0) + 200;
-        buf = await readRows(c, `${pool} ORDER BY hash(__row, ${seed}), __row LIMIT ${b} OFFSET ${off}`);
+        buf = await readRows(c, `${pool} ORDER BY ${orderBy} LIMIT ${b} OFFSET ${off}`);
         off += buf.length; done = buf.length < b;
       }
       return buf.shift();
     };
     const req = F.filter((f) => f.required).map((f) => f.name);
-    const written = [], skipped = [];
+    const written = [], skipped = [], strata = [];
     for (const [i, v] of views.entries()) {
-      const rows = []; let sk = 0;
+      const rows = [], per = {}; let sk = 0;
       while (rows.length < parts[i].n) {
         const r = await next(); if (!r) break;
-        const x = convertRow(r, v);
-        if (x._skipped || !req.every((k) => x[k] != null)) sk++; else rows.push(x);
+        const { __stratum, __rank, ...src } = r;
+        const x = convertRow(src, v);
+        if (x._skipped || !req.every((k) => x[k] != null)) sk++; else { rows.push(x); if (strat) per[__stratum ?? 'null'] = (per[__stratum ?? 'null'] || 0) + 1; }
       }
-      written.push(rows); skipped.push(sk);
+      written.push(rows); skipped.push(sk); strata.push(per);
     }
+    const top = (m) => Object.fromEntries(Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 100));
+    const allStrata = strata.reduce((a, m) => { for (const [k, n] of Object.entries(m)) a[k] = (a[k] || 0) + n; return a; }, {});
     await conn.run('BEGIN');
     const names = ['id', 'dataset_id', 'write_key', 'source_row', ...F.map((f) => f.name)];
     const ins = await conn.prepare(`INSERT INTO ${T} (${names.map((n) => `"${n}"`).join(',')}) VALUES (${names.map((_, i) => '$' + (i + 1)).join(',')})`);
@@ -872,7 +926,8 @@ export async function convertAndWrite(id, o = {}) {
     return { ...(cleaned && { cleanup: cleaned }), mode, dataset_id: st.dataset_id, schema: st.schema.name, table: st.schema.table, target: displayName(tg.tpath), rows_written, total_rows_in_target: total, seed,
       pool_rows: poolRows, ...(excluded.length && { excluded_rows: excluded.length }),
       ...(skipped.some(Boolean) && { rows_skipped: skipped.reduce((a, b) => a + b, 0) }),
-      ...(o.splits?.length ? { splits: parts.map((p, i) => ({ tag: p.key, requested: p.n, rows_written: written[i].length, ...(skipped[i] && { rows_skipped: skipped[i] }) })) } : { write_key: parts[0].key }) };
+      ...(strat && { stratify_by: o.stratify_by, strata_values: Object.keys(allStrata).length, strata: top(allStrata) }),
+      ...(o.splits?.length ? { splits: parts.map((p, i) => ({ tag: p.key, requested: p.n, rows_written: written[i].length, ...(skipped[i] && { rows_skipped: skipped[i] }), ...(strat && { strata: top(strata[i]) }) })) } : { write_key: parts[0].key }) };
   } catch (e) {
     await conn.run('ROLLBACK').catch(() => {});
     throw e;
