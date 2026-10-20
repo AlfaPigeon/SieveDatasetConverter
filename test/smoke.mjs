@@ -134,5 +134,40 @@ const w9 = await core.convertAndWrite(d7.dataset_id, { target: 'e', field_option
 assert.deepEqual(w9.splits[0].strata, { big: 3, mid: 3, small: 3 });
 assert.deepEqual(w9.strata, { big: 11, mid: 7, small: 3 }); // small has 3 rows, mid 7: the rest is topped up from big
 
+// explode: one row per list element, step/steps in meta, history; profile; value_from + balance; distinct_by; duplicates; copy_rows
+const src8 = path.join(dir, 'src8.jsonl');
+fs.writeFileSync(src8, Array.from({ length: 12 }, (_, i) => JSON.stringify({ task: `t${i % 6}`, actions: Array.from({ length: 1 + (i % 3) }, (_, k) => ({ op: k ? 'type' : 'click', v: `a${k}` })) })).join('\n'));
+const d8 = await core.importDataset(src8, { limit: 'all', explode: { column: 'actions', as: 'action', history: true }, mapping: { input: ['task'], label: ['action.op'] } });
+assert.equal(d8.row_count, 24); // 4 × (1 + 2 + 3)
+assert.ok(['action', 'explode_step', 'explode_steps', 'explode_history'].every((n) => d8.columns.some((c) => c.name === n)));
+const e8 = (await core.preview(d8.dataset_id, 3)).converted;
+assert.deepEqual(e8.map((x) => [x.source_row, x.meta.step, x.meta.steps]), [[0, 0, 1], [1000, 0, 2], [1001, 1, 2]]);
+const h8 = (await core.preview(d8.dataset_id, 1, 'explode_step = 2')).raw[0];
+assert.deepEqual(h8.explode_history.map((x) => x.v), ['a0', 'a1']);
+const pf = await core.profile(d8.dataset_id, { top: 2 });
+assert.equal(pf.rows, 24);
+assert.deepEqual(pf.columns.find((c) => c.name === 'explode_steps'), { name: 'explode_steps', type: 'BIGINT', nulls: 0, distinct: 3, top: [{ value: '3', count: 12 }, { value: '2', count: 8 }] });
+// value_from on the label + balance on it: 8 click rows vs 16 type rows -> 6/6
+const wb = await core.convertAndWrite(d8.dataset_id, { target: 'x', mode: 'create', sample: 12, balance: 'label', overrides: { options: ['true', 'false'] },
+  field_options: { label: { value_from: { column: 'action.op', map: { click: 'true', '*': 'false' } } } } });
+assert.deepEqual(wb.strata, { true: 6, false: 6 });
+const wd = await core.convertAndWrite(d8.dataset_id, { target: 'x', write_key: 'd', sample: 24, distinct_by: 'task' });
+assert.equal(wd.rows_written, 6);
+// copy_rows keeps source_row and meta; n samples; records follow
+const cr = await core.copyRows({ source_target: 'x', target: 'y', where: "write_key = 'd'", n: 4 });
+assert.equal(cr.rows_copied, 4); assert.equal(cr.records_copied, 1);
+const yq = async (sql) => { const i = await DuckDBInstance.create(path.join(dir, 'y.duckdb')); const c = await i.connect(); try { return (await c.runAndReadAll(sql)).getRowObjectsJS(); } finally { c.closeSync(); i.closeSync(); } };
+const xq = async (sql) => { const i = await DuckDBInstance.create(path.join(dir, 'x.duckdb')); const c = await i.connect(); try { return (await c.runAndReadAll(sql)).getRowObjectsJS(); } finally { c.closeSync(); i.closeSync(); } };
+const ys = await yq('SELECT id, source_row, meta::VARCHAR m FROM rows ORDER BY id'), xs = await xq('SELECT id, source_row, meta::VARCHAR m FROM rows ORDER BY id');
+assert.ok(ys.every((y) => xs.some((x) => x.id === y.id && x.source_row === y.source_row && x.m === y.m)));
+assert.equal(Number((await yq("SELECT rows_written FROM datasets"))[0].rows_written), 4);
+// duplicate option texts (after trim) skip the row unless allow_duplicates
+const src9 = path.join(dir, 'src9.jsonl');
+fs.writeFileSync(src9, [{ q: 'a', o: ['x', 'x '] }, { q: 'b', o: ['x', 'y'] }].map((x) => JSON.stringify(x)).join('\n'));
+const d9 = await core.importDataset(src9, { limit: 'all', mapping: { input: ['q'], options: ['o'], label: [] } });
+assert.equal((await core.preview(d9.dataset_id, 1)).converted[0]._skipped, 'duplicate options in options');
+await core.setMetadata(d9.dataset_id, {}, { field_options: { options: { allow_duplicates: true } } });
+assert.equal((await core.preview(d9.dataset_id, 1)).converted[0]._skipped, undefined);
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log('smoke test passed');

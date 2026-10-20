@@ -300,14 +300,15 @@ function neededColumns(names, opts) {
     return opts.columns;
   }
   const maps = [opts.mapping, ...(opts.splits || []).map((p) => p?.mapping)].filter(Boolean);
-  const refs = [...maps.flatMap((m) => Object.values(m).flat()), ...(Array.isArray(opts.metadata) ? opts.metadata.map((e) => e?.column) : [])]
+  const ex = opts.explode && (typeof opts.explode === 'string' ? opts.explode : opts.explode.column);
+  const refs = [...maps.flatMap((m) => Object.values(m).flat()), ...(Array.isArray(opts.metadata) ? opts.metadata.map((e) => e?.column) : []), ...(ex ? [ex] : [])]
     .filter((x) => x != null && x !== 'source_row').map(String);
   if (!refs.length) return null;
   const used = new Set(refs.map((r) => (names.includes(r) ? r : r.split(/[.[]/)[0])).filter((n) => names.includes(n)));
   for (const p of [opts.where, ...(opts.splits || []).map((x) => x?.where)].filter(Boolean))
     for (const n of names) if (new RegExp(`(^|[^\\w])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^\\w])`).test(p)) used.add(n);
   for (const fo of [opts.field_options, ...(opts.splits || []).map((p) => p?.field_options)].flatMap((x) => Object.values(x || {})))
-    for (const g of [fo?.gold_from?.column, ...(fo?.gold_from?.argmax_of || [])].filter(Boolean).map((x) => String(x).split(/[.[]/)[0])) if (names.includes(g)) used.add(g);
+    for (const g of [fo?.gold_from?.column, fo?.value_from?.column, ...(fo?.gold_from?.argmax_of || [])].filter(Boolean).map((x) => String(x).split(/[.[]/)[0])) if (names.includes(g)) used.add(g);
   return used.size ? [...used] : null;
 }
 // Local files to re-import: a dataset_id (its files in data/downloads) or a glob pattern.
@@ -390,7 +391,10 @@ export async function importDataset(url, opts = {}) {
     if (local) url = local.length > 1 ? `${path.basename(local[0])} (+${local.length - 1} files)` : path.basename(local[0]); // keep local paths out of results
   }
   src = limited(src, limit);
-  let cols = (await c.runAndReadAll(`DESCRIBE SELECT * FROM ${src}`)).getRowObjectsJson().map((r) => ({ name: r.column_name, type: r.column_type }));
+  const describe = async (x) => (await c.runAndReadAll(`DESCRIBE SELECT * FROM ${x}`)).getRowObjectsJson().map((r) => ({ name: r.column_name, type: r.column_type }));
+  let cols = await describe(src);
+  let explode = null;
+  if (opts.explode) ({ src, explode } = explodeSrc(src, cols, opts.explode)), cols = await describe(src);
   const rowCol = cols.some((x) => x.name === ROWCOL);
   cols = cols.filter((x) => x.name !== ROWCOL);
   const rowCount = Number((await c.runAndReadAll(`SELECT count(*) n FROM ${src}`)).getRowObjectsJson()[0].n);
@@ -402,7 +406,7 @@ export async function importDataset(url, opts = {}) {
     hf: hf && { repo, config: hf.config, split: hf.split, shards: hf.shards, via: hf.via, ...(hf.fetch && { fetch: hf.fetch }), ...(hf.seed != null && { seed: hf.seed }), ...(hf.row_groups && { row_groups: hf.row_groups }), ...(hf.network_bytes != null && { network_bytes: hf.network_bytes, data_bytes: hf.data_bytes, cached_bytes: hf.cached_bytes }), ...(hf.columns && { columns: hf.columns }), ...(hf.listing && { listing: hf.listing }), ...(hf.errors && { fallback_errors: hf.errors }) },
     files, download_bytes: bytesOf(files), class_labels: classLabels(features),
     metadata: [{ key: 'name', value: name }, { key: 'domain', value: 'general' }, { key: 'source', value: url }],
-    meta_column: null, field_options: {},
+    meta_column: null, field_options: {}, ...(explode && { explode }),
     schema: null, mapping: {}, overrides: {},
   };
   useSchema(st, opts.schema || 'default');
@@ -410,6 +414,48 @@ export async function importDataset(url, opts = {}) {
   if (opts.field_options) st.field_options = normFieldOptions(st, opts.field_options);
   datasets.set(id, st);
   return summary(st);
+}
+
+// explode: one row per element of a list column or path. The element goes into `as` (default: the column, or the
+// path's last name); explode_step (0-based), explode_steps and, with history, explode_history (the preceding elements,
+// or the last N) are added. source_row = source row × 1000 + step (lists are cut at 1000 elements).
+const EXPLODE_MAX = 1000;
+function explodeSrc(src, cols, ex) {
+  ex = typeof ex === 'string' ? { column: ex } : ex || {};
+  if (!ex.column) throw new Error('explode needs a column or path');
+  const st = { columns: cols.filter((x) => x.name !== ROWCOL) };
+  const ref = checkRef(st, ex.column, 'explode'), root = ref.split(/[.[]/)[0], type = st.columns.find((x) => x.name === root).type;
+  let list;
+  if (/^(JSON|VARCHAR)$/.test(type)) {
+    const toks = [...ref.slice(root.length).matchAll(/([^.[\]]+)|\[(\d+)\]/g)].map((m) => m[1] ?? m[2]);
+    list = `json_extract(${ident(root)}, ${q('$' + toks.map((t) => (/^\d+$/.test(t) ? `[${t}]` : `.${JSON.stringify(t)}`)).join('') + '[*]')})`;
+  } else list = pathSql(st, ref, 'explode');
+  const as = ex.as || (ref === root ? root : ref.split(/[.[\]]/).filter((t) => t && !/^\d+$/.test(t)).pop());
+  const h = ex.history === true ? EXPLODE_MAX : Math.max(0, intOr(ex.history, 0));
+  const base = cols.some((x) => x.name === ROWCOL) ? ROWCOL : 'row_number() OVER () - 1';
+  const drop = [...new Set(['__l', '__e', '__i', '__b', ...(cols.some((x) => x.name === ROWCOL) ? [ROWCOL] : []), ...(st.columns.some((x) => x.name === as) ? [as] : [])])].map(ident).join(', ');
+  const inner = `(SELECT *, unnest(__l) AS __e, generate_subscripts(__l, 1) AS __i FROM (SELECT *, list_slice(${list}, 1, ${EXPLODE_MAX}) AS __l, ${base} AS __b FROM ${src}))`;
+  return {
+    src: `(SELECT * EXCLUDE (${drop}), __e AS ${ident(as)}, (__i - 1)::BIGINT AS explode_step, len(__l)::BIGINT AS explode_steps${h ? `, list_slice(__l, greatest(1, __i - ${h}), __i - 1) AS explode_history` : ''}, (__b * ${EXPLODE_MAX} + __i - 1)::BIGINT AS ${ROWCOL} FROM ${inner})`,
+    explode: { column: ref, as, ...(h && { history: ex.history === true ? true : h }) },
+  };
+}
+
+// Column profile over the imported rows: type, nulls, distinct values and the top values (text cut at 80 chars).
+export async function profile(id, { top = 5, where } = {}) {
+  const st = get(id);
+  const c = await memConn();
+  const from = `${numbered(st)} WHERE ${whereSql(where)}`;
+  const k = Math.min(Math.max(intOr(top, 5), 0), 50);
+  const n = Number((await c.runAndReadAll(`SELECT count(*) n FROM ${from}`)).getRowObjectsJson()[0].n);
+  const columns = [];
+  for (const col of st.columns) {
+    const e = `CAST(${ident(col.name)} AS VARCHAR)`;
+    const [a] = (await c.runAndReadAll(`SELECT count(*) FILTER (WHERE ${ident(col.name)} IS NULL)::BIGINT nn, count(DISTINCT ${e})::BIGINT nd FROM ${from}`)).getRowObjectsJson();
+    const tv = k ? (await c.runAndReadAll(`SELECT left(${e}, 80) AS "v", count(*)::BIGINT AS "n" FROM ${from} AND ${ident(col.name)} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT ${k}`)).getRowObjectsJson() : [];
+    columns.push({ name: col.name, type: col.type, nulls: +a.nn, distinct: +a.nd, top: tv.map((x) => ({ value: x.v, count: +x.n })) });
+  }
+  return { dataset_id: id, rows: n, columns };
 }
 
 // Suggest source columns for each schema field from its name + aliases.
@@ -556,6 +602,7 @@ function normFieldOptions(st, fo) {
     if (o.label_mode != null && !LABEL_MODES.includes(o.label_mode)) throw new Error(`field_options.${field}.label_mode must be one of ${LABEL_MODES}`);
     if (o.gold_from?.column) checkRef(st, o.gold_from.column, `field_options.${field}.gold_from`);
     if (o.gold_from) goldFromCheck(o.gold_from, `field_options.${field}.gold_from`);
+    if (o.value_from) { if (!o.value_from.column) throw new Error(`field_options.${field}.value_from needs a column`); checkRef(st, o.value_from.column, `field_options.${field}.value_from`); }
     for (const p of o.gold_from?.argmax_of || []) checkRef(st, p, `field_options.${field}.gold_from.argmax_of`);
     out[field] = o;
   }
@@ -716,7 +763,7 @@ function convertRow(r, st) {
   const F = st.schema.fields.map((f) => ({ ...f, ...st.field_options?.[f.name] }));
   const wk = st.write_key ? `${st.write_key}-` : '';
   const out = { id: `${st.dataset_id}-${wk}${row}`, dataset_id: st.dataset_id, source_row: row };
-  const meta = Object.fromEntries(st.metadata.map((e) => [e.key, e.column ? pick(r, e.column) : e.value]));
+  const meta = { ...(st.explode && { step: r.explode_step ?? null, steps: r.explode_steps ?? null }), ...Object.fromEntries(st.metadata.map((e) => [e.key, e.column ? pick(r, e.column) : e.value])) };
   const raw = {}, gold = {}, cut = new Set(), explicit = {};
   const optionFields = new Set(F.filter((f) => LATE.includes(f.transform)).map((f) => f.option_field));
   const metaField = F.find((f) => f.name === st.meta_column);
@@ -740,6 +787,10 @@ function convertRow(r, st) {
     if (f.name in st.overrides) v = st.overrides[f.name];
     else if (f.name in gold) v = gold[f.name];
     else if (f === metaField) { if (cut.size) Object.assign(meta, { truncated: true, truncated_fields: [...cut] }); v = meta; }
+    else if (f.value_from?.column) { // value -> mapped value ("*" = any other value)
+      const x = asText(pick(r, f.value_from.column)), m = f.value_from.map;
+      v = !m ? x : x != null && Object.hasOwn(m, x) ? m[x] : Object.hasOwn(m, '*') ? m['*'] : null;
+    }
     else if (f.transform === 'constant') v = f.value;
     else if (f.transform === 'metadata') v = meta[f.value || f.name];
     else if (f.transform === 'meta') v = null;
@@ -781,9 +832,16 @@ function convertRow(r, st) {
     if (f.enum && v != null && !f.enum.includes(v)) throw new Error(`field ${f.name}: "${v}" not in ${f.enum}`);
     out[f.name] = v;
   }
-  // Options / shuffle items that are empty or whitespace-only count as missing: the row is skipped (allow_empty: true keeps it).
-  for (const f of F.filter((x) => (x.transform === 'shuffle' || optionFields.has(x.name)) && !x.allow_empty && !(x.name in st.overrides)))
-    if (Array.isArray(out[f.name]) && out[f.name].some((x) => x == null || (typeof x === 'string' && !x.trim()))) out._skipped ||= `empty option in ${f.name}`;
+  // Options / shuffle items that are empty or whitespace-only count as missing, and repeated texts (after trim) make the
+  // choice ambiguous: such rows are skipped (allow_empty / allow_duplicates: true keep them).
+  for (const f of F.filter((x) => (x.transform === 'shuffle' || optionFields.has(x.name)) && !(x.name in st.overrides)))
+  {
+    const l = out[f.name];
+    if (!Array.isArray(l)) continue;
+    if (!f.allow_empty && l.some((x) => x == null || (typeof x === 'string' && !x.trim()))) out._skipped ||= `empty option in ${f.name}`;
+    const t = l.map((x) => (typeof x === 'string' ? x.trim() : asText(x)));
+    if (!f.allow_duplicates && new Set(t).size < t.length) out._skipped ||= `duplicate options in ${f.name}`;
+  }
   // A label that is missing or not an option takes the argmax option of its distribution (e.g. a binned score).
   for (const f of F.filter((x) => x.transform === 'label_to_option' && !(x.name in st.overrides))) {
     const d = F.find((g) => g.transform === 'label_to_distribution' && g.option_field === f.option_field && out[g.name]);
@@ -858,6 +916,9 @@ export async function convertAndWrite(id, o = {}) {
     field_options: { ...st.field_options, ...normFieldOptions(st, o.field_options), ...normFieldOptions(st, p.field_options) } }));
   const T = `"${st.schema.table}"`, F = st.schema.fields;
   const filter = whereSql(where);
+  // check stratify_by / distinct_by / balance before a target file is created
+  for (const [k, v] of [['stratify_by', o.stratify_by], ['distinct_by', o.distinct_by]]) if (v) pathSql(st, v, k);
+  if (o.balance && !st.schema.fields.some((f) => f.name === o.balance)) throw new Error(`balance: schema ${st.schema.name} has no field "${o.balance}"`);
   const tg = await openTarget(target);
   const { conn } = tg;
   try {
@@ -872,8 +933,12 @@ export async function convertAndWrite(id, o = {}) {
         .getRowObjectsJson().map((x) => Number(x.r));
     }
     const c = await memConn();
+    if (o.stratify_by && o.balance) throw new Error('use stratify_by (a source column) or balance (a schema field), not both');
     const strat = o.stratify_by ? pathSql(st, o.stratify_by, 'stratify_by') : null;
-    const base = `SELECT *${strat ? `, CAST(${strat} AS VARCHAR) AS __stratum` : ''} FROM ${numbered(st)} WHERE ${filter}${excluded.length ? ` AND __row NOT IN (${excluded.join(',')})` : ''}`;
+    const dist = o.distinct_by ? pathSql(st, o.distinct_by, 'distinct_by') : null;
+    let base = `SELECT *${strat ? `, CAST(${strat} AS VARCHAR) AS __stratum` : ''} FROM ${numbered(st)} WHERE ${filter}${excluded.length ? ` AND __row NOT IN (${excluded.join(',')})` : ''}`;
+    // distinct_by: keep one (seeded) row per value; rows where it is null are all kept
+    if (dist) base = `SELECT * EXCLUDE (__d, __dn) FROM (SELECT *, CAST(${dist} AS VARCHAR) AS __d, row_number() OVER (PARTITION BY CAST(${dist} AS VARCHAR) ORDER BY hash(__row, ${seed}), __row) AS __dn FROM (${base})) WHERE __d IS NULL OR __dn = 1`;
     // stratify_by: rank rows within each value, then take rank 1 of every value, rank 2, ... (values that run out leave room for the rest)
     const pool = strat ? `SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY __stratum ORDER BY hash(__row, ${seed}), __row) AS __rank FROM (${base}))` : base;
     const orderBy = strat ? `__rank, hash(__stratum, ${seed}), hash(__row, ${seed}), __row` : `hash(__row, ${seed}), __row`;
@@ -891,14 +956,33 @@ export async function convertAndWrite(id, o = {}) {
       return buf.shift();
     };
     const req = F.filter((f) => f.required).map((f) => f.name);
+    const bad = (x) => x._skipped || !req.every((k) => x[k] != null);
+    // balance: a schema field (e.g. the mapped label). The whole pool is converted, grouped by that field's value and
+    // interleaved like stratify_by (one row per value, then a second, ...); each split takes the next rows.
+    let ready = null, poolSkipped = 0;
+    if (o.balance) {
+      if (!F.some((f) => f.name === o.balance)) throw new Error(`balance: schema ${st.schema.name} has no field "${o.balance}"`);
+      const all = await readRows(c, `${pool} ORDER BY ${orderBy}`), groups = new Map();
+      for (const r of all) {
+        const x = convertRow(r, views[0]);
+        if (bad(x)) { poolSkipped++; continue; }
+        const k = asText(x[o.balance]) ?? 'null';
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(r);
+      }
+      const keys = seededShuffle([...groups.keys()].sort(), seed);
+      ready = [];
+      for (let i = 0; ready.length < all.length - poolSkipped; i++) for (const k of keys) { const g = groups.get(k); if (i < g.length) ready.push({ ...g[i], __stratum: k }); }
+    }
+    const nextRow = ready ? async () => ready.shift() : next;
     const written = [], skipped = [], strata = [];
     for (const [i, v] of views.entries()) {
       const rows = [], per = {}; let sk = 0;
       while (rows.length < parts[i].n) {
-        const r = await next(); if (!r) break;
+        const r = await nextRow(); if (!r) break;
         const { __stratum, __rank, ...src } = r;
         const x = convertRow(src, v);
-        if (x._skipped || !req.every((k) => x[k] != null)) sk++; else { rows.push(x); if (strat) per[__stratum ?? 'null'] = (per[__stratum ?? 'null'] || 0) + 1; }
+        if (bad(x)) sk++; else { rows.push(x); if (strat || ready) per[__stratum ?? 'null'] = (per[__stratum ?? 'null'] || 0) + 1; }
       }
       written.push(rows); skipped.push(sk); strata.push(per);
     }
@@ -926,12 +1010,55 @@ export async function convertAndWrite(id, o = {}) {
     return { ...(cleaned && { cleanup: cleaned }), mode, dataset_id: st.dataset_id, schema: st.schema.name, table: st.schema.table, target: displayName(tg.tpath), rows_written, total_rows_in_target: total, seed,
       pool_rows: poolRows, ...(excluded.length && { excluded_rows: excluded.length }),
       ...(skipped.some(Boolean) && { rows_skipped: skipped.reduce((a, b) => a + b, 0) }),
-      ...(strat && { stratify_by: o.stratify_by, strata_values: Object.keys(allStrata).length, strata: top(allStrata) }),
-      ...(o.splits?.length ? { splits: parts.map((p, i) => ({ tag: p.key, requested: p.n, rows_written: written[i].length, ...(skipped[i] && { rows_skipped: skipped[i] }), ...(strat && { strata: top(strata[i]) }) })) } : { write_key: parts[0].key }) };
+      ...((strat || ready) && { [ready ? 'balance' : 'stratify_by']: o.balance || o.stratify_by, strata_values: Object.keys(allStrata).length, strata: top(allStrata) }),
+      ...(poolSkipped && { pool_rows_skipped: poolSkipped }), ...(dist && { distinct_by: o.distinct_by }),
+      ...(o.splits?.length ? { splits: parts.map((p, i) => ({ tag: p.key, requested: p.n, rows_written: written[i].length, ...(skipped[i] && { rows_skipped: skipped[i] }), ...((strat || ready) && { strata: top(strata[i]) }) })) } : { write_key: parts[0].key }) };
   } catch (e) {
     await conn.run('ROLLBACK').catch(() => {});
     throw e;
   } finally { tg.close(); }
+}
+
+// Copy written rows from one target file to another (rows keep id, source_row, meta, write_key, created_at), with their
+// datasets records. where filters the source table; n takes a seeded sample. Rows with the same id are replaced.
+export async function copyRows({ source_target, table, target, where, n, seed = 42 } = {}) {
+  if (!source_target || !target) throw new Error('copy_rows needs source_target and target');
+  const sp = resolveTarget(source_target);
+  if (!fs.existsSync(sp)) throw new Error(`${displayName(sp)} does not exist`);
+  if (sp === resolveTarget(target)) throw new Error('source_target and target are the same file');
+  const tg = await openTarget(target);
+  const { conn } = tg;
+  try {
+    await conn.run(`ATTACH ${q(sp)} AS sieve_src (READ_ONLY)`);
+    const tables = (await conn.runAndReadAll("SELECT table_name t FROM duckdb_tables() WHERE database_name = 'sieve_src' AND table_name <> 'datasets' ORDER BY 1")).getRowObjectsJson().map((x) => x.t);
+    if (!table && tables.length !== 1) throw new Error(`pass table: ${tables.join(', ') || '(no tables)'}`);
+    table ||= tables[0];
+    if (!tables.includes(table)) throw new Error(`Unknown table "${table}". Tables: ${tables.join(', ')}`);
+    const T = ident(table), hasRecs = (await conn.runAndReadAll("SELECT count(*)::INT n FROM duckdb_tables() WHERE database_name = 'sieve_src' AND table_name = 'datasets'")).getRowObjectsJson()[0].n > 0;
+    const schemaName = hasRecs ? (await conn.runAndReadAll('SELECT any_value(schema_name) s FROM sieve_src.datasets WHERE table_name = $1', [table])).getRowObjectsJson()[0]?.s : null;
+    let schema = null; try { schema = schemaName && getSchema(schemaName); } catch {}
+    if (schema && schema.table === table) { // create/upgrade the target like a write (prepareTarget looks at main.* only)
+      await conn.run('DETACH sieve_src'); await prepareTarget(conn, schema); await conn.run(`ATTACH ${q(sp)} AS sieve_src (READ_ONLY)`);
+    } else await conn.run(`CREATE TABLE IF NOT EXISTS ${T} AS SELECT * FROM sieve_src.${T} LIMIT 0`);
+    const sel = `SELECT * FROM sieve_src.${T} WHERE ${whereSql(where)} ORDER BY hash(id, ${intOr(seed, 42)}), id${n != null ? ` LIMIT ${Math.max(0, intOr(n, 0))}` : ''}`;
+    await conn.run('BEGIN');
+    await conn.run(`CREATE TEMP TABLE sieve_copy AS ${sel}`);
+    await conn.run(`DELETE FROM ${T} WHERE id IN (SELECT id FROM sieve_copy)`);
+    await conn.run(`INSERT INTO ${T} BY NAME SELECT * FROM sieve_copy`);
+    const copied = Number((await conn.runAndReadAll('SELECT count(*) n FROM sieve_copy')).getRowObjectsJson()[0].n);
+    let records = 0;
+    if (hasRecs && (await conn.runAndReadAll("SELECT count(*)::INT n FROM duckdb_tables() WHERE database_name = current_database() AND table_name = 'datasets'")).getRowObjectsJson()[0].n) {
+      const inKeys = (a) => `EXISTS (SELECT 1 FROM sieve_copy k WHERE k.dataset_id = ${a}.dataset_id AND coalesce(k.write_key, '') = coalesce(${a}.write_key, ''))`;
+      await conn.run(`DELETE FROM datasets d WHERE table_name = $1 AND ${inKeys('d')}`, [table]);
+      await conn.run(`INSERT INTO datasets BY NAME SELECT * FROM sieve_src.datasets d WHERE table_name = $1 AND ${inKeys('d')}`, [table]);
+      await conn.run(`UPDATE datasets d SET rows_written = (SELECT count(*) FROM ${T} r WHERE r.dataset_id = d.dataset_id AND coalesce(r.write_key, '') = coalesce(d.write_key, '')) WHERE table_name = $1 AND ${inKeys('d')}`, [table]);
+      records = Number((await conn.runAndReadAll(`SELECT count(*) n FROM datasets d WHERE table_name = $1 AND ${inKeys('d')}`, [table])).getRowObjectsJson()[0].n);
+    }
+    await conn.run('DROP TABLE sieve_copy');
+    await conn.run('COMMIT');
+    const total = Number((await conn.runAndReadAll(`SELECT count(*) n FROM ${T}`)).getRowObjectsJson()[0].n);
+    return { source_target: displayName(sp), target: displayName(tg.tpath), table, rows_copied: copied, records_copied: records, total_rows_in_target: total };
+  } catch (e) { await conn.run('ROLLBACK').catch(() => {}); throw e; } finally { tg.close(); }
 }
 
 // Remove a dataset's rows (all write_keys, or one) and its datasets records from a target file.
@@ -959,8 +1086,8 @@ export async function deleteDataset(id, { target = 'datasets.duckdb', write_key 
 }
 
 // One shot: HF name/URL + schema -> download, auto-map, sample, write.
-export async function runPipeline({ url, schema = 'default', config, split, format, table, limit, fetch, columns, fetch_seed, row_groups, max_rows_per_group, metadata, target_column, mapping, overrides, field_options, target, mode, ...write }) {
-  const imp = await importDataset(url, { schema, config, split, format, table, limit, fetch, columns, seed: fetch_seed, row_groups, max_rows_per_group, mapping, metadata, where: write.where, splits: write.splits, field_options });
+export async function runPipeline({ url, schema = 'default', config, split, format, table, limit, fetch, columns, fetch_seed, row_groups, max_rows_per_group, explode, metadata, target_column, mapping, overrides, field_options, target, mode, ...write }) {
+  const imp = await importDataset(url, { schema, config, split, format, table, limit, fetch, columns, seed: fetch_seed, row_groups, max_rows_per_group, explode, mapping, metadata, where: write.where, splits: write.splits, field_options });
   await setMetadata(imp.dataset_id, metadata, { mapping, overrides, target_column, field_options });
   const res = await convertAndWrite(imp.dataset_id, { ...write, target, mode: mode || (fs.existsSync(resolveTarget(target)) ? 'append' : 'create') });
   return { ...res, download_bytes: imp.download_bytes, hf: imp.hf, mapping: datasets.get(imp.dataset_id).mapping };
