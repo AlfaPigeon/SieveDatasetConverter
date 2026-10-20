@@ -1038,13 +1038,16 @@ const intOr = (v, d) => (Number.isFinite(+v) && v !== '' && v != null ? Math.flo
 export const convertAndWrite = (id, o = {}) => withCompact(o, () => writeRows(id, o));
 export const copyRows = (o = {}) => withCompact(o, () => copyRowsInner(o));
 export const deleteDataset = (id, o = {}) => withCompact(o, () => deleteInner(id, o));
+// The same seeded sample a write would take, converted but not written (for previews, e.g. a board's mix).
+export const sampleRows = (id, o = {}) => writeRows(id, { ...o, dry_run: true });
 async function writeRows(id, o) {
   const { target = 'datasets.duckdb', mode = 'append', cleanup = false, where, exclude_dataset_ids = [], exclude_same_source = false } = o;
+  const dry = !!o.dry_run;
   if (!['create', 'append'].includes(mode)) throw new Error('mode must be create or append');
-  const exists = fs.existsSync(resolveTarget(target));
+  const exists = !dry && fs.existsSync(resolveTarget(target));
   const shown = displayName(resolveTarget(target));
-  if (mode === 'create' && exists) throw new Error(`${shown} already exists (use mode=append)`);
-  if (mode === 'append' && !exists) throw new Error(`${shown} does not exist (use mode=create)`);
+  if (!dry && mode === 'create' && exists) throw new Error(`${shown} already exists (use mode=append)`);
+  if (!dry && mode === 'append' && !exists) throw new Error(`${shown} does not exist (use mode=create)`);
   const st = get(id);
   const seed = intOr(o.seed, 42);
   const parts = (o.splits?.length ? o.splits : [{ tag: o.write_key || '', n: o.sample }]).map((p) => ({ ...p, key: String(p.tag ?? ''), n: Math.max(1, intOr(p.n, 500)) }));
@@ -1063,12 +1066,12 @@ async function writeRows(id, o) {
   const dist = o.distinct_by ? await pathExpr(c, st, o.distinct_by, 'distinct_by') : null;
   const perValue = Math.max(1, intOr(o.max_per_value, 1));
   let P = null; // temp table with the ordered pool
-  const tg = await openTarget(target);
-  const { conn } = tg;
+  const tg = dry ? null : await openTarget(target);
+  const conn = tg?.conn;
   try {
-    await prepareTarget(conn, st.schema);
+    if (!dry) await prepareTarget(conn, st.schema);
     let excluded = [];
-    if (exclude_dataset_ids.length || exclude_same_source) {
+    if (!dry && (exclude_dataset_ids.length || exclude_same_source)) {
       const ids = exclude_dataset_ids.map(String);
       excluded = (await conn.runAndReadAll(`SELECT DISTINCT source_row r FROM ${T} WHERE (dataset_id IN (SELECT unnest(from_json($1, '["VARCHAR"]')))
         OR ($2 AND dataset_id IN (SELECT dataset_id FROM datasets WHERE source_key = $3 AND table_name = $4)))
@@ -1115,6 +1118,12 @@ async function writeRows(id, o) {
     }
     const top = (m) => Object.fromEntries(Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 100));
     const allStrata = strata.reduce((a, m) => { for (const [k, n] of Object.entries(m)) a[k] = (a[k] || 0) + n; return a; }, {});
+    if (dry) {
+      await c.run(`DROP TABLE IF EXISTS ${P}`);
+      return { dataset_id: st.dataset_id, schema: st.schema.name, seed, pool_rows: poolRows, rows: written.flat(),
+        ...(skipped.some(Boolean) && { rows_skipped: skipped.reduce((a, b) => a + b, 0), skip_reasons: top(reasons) }),
+        ...(strat && { strata: top(allStrata) }) };
+    }
     await conn.run('BEGIN');
     const names = ['id', 'dataset_id', 'write_key', 'source_row', ...F.map((f) => f.name)];
     const ins = await conn.prepare(`INSERT INTO ${T} (${names.map((n) => `"${n}"`).join(',')}) VALUES (${names.map((_, i) => '$' + (i + 1)).join(',')})`);
@@ -1142,10 +1151,10 @@ async function writeRows(id, o) {
       ...(dist && { distinct_by: o.distinct_by, max_per_value: perValue }),
       ...(o.splits?.length ? { splits: parts.map((p, i) => ({ tag: p.key, requested: p.n, rows_written: written[i].length, ...(skipped[i] && { rows_skipped: skipped[i] }), ...(strat && { strata: top(strata[i]) }) })) } : { write_key: parts[0].key }) };
   } catch (e) {
-    await conn.run('ROLLBACK').catch(() => {});
+    await conn?.run('ROLLBACK').catch(() => {});
     if (P) await c.run(`DROP TABLE IF EXISTS ${P}`).catch(() => {});
     throw oomHint(e);
-  } finally { tg.close(); }
+  } finally { tg?.close(); }
 }
 
 let poolSeq = 0;
@@ -1265,6 +1274,22 @@ async function deleteInner(id, { target = 'datasets.duckdb', write_key } = {}) {
     await tg.conn.run(`DELETE FROM datasets WHERE dataset_id = $1${cond}`, [id]);
     await tg.conn.run('COMMIT');
     return { dataset_id: id, write_key: wk, target: displayName(tg.tpath), rows_deleted: rows, records_deleted: records };
+  } catch (e) { await tg.conn.run('ROLLBACK').catch(() => {}); throw e; } finally { tg.close(); }
+}
+// Delete every row written under one write_key in a table (any dataset_id) and its datasets records; used by boards,
+// whose write_key owns its rows, so a re-run replaces the previous run even when sources were re-imported.
+export async function deleteWriteKey(target, table, write_key) {
+  if (!fs.existsSync(resolveTarget(target))) return { rows_deleted: 0 };
+  const tg = await openTarget(target);
+  try {
+    const has = async (t) => (await tg.conn.runAndReadAll("SELECT count(*)::INT n FROM duckdb_columns() WHERE schema_name = 'main' AND table_name = $1 AND column_name = 'write_key'", [t])).getRowObjectsJson()[0].n > 0;
+    if (!(await has(table))) return { rows_deleted: 0 };
+    await tg.conn.run('BEGIN');
+    const rows = Number((await tg.conn.runAndReadAll(`SELECT count(*) n FROM ${ident(table)} WHERE write_key = $1`, [String(write_key)])).getRowObjectsJson()[0].n);
+    await tg.conn.run(`DELETE FROM ${ident(table)} WHERE write_key = $1`, [String(write_key)]);
+    if (await has('datasets')) await tg.conn.run('DELETE FROM datasets WHERE table_name = $1 AND write_key = $2', [table, String(write_key)]);
+    await tg.conn.run('COMMIT');
+    return { rows_deleted: rows };
   } catch (e) { await tg.conn.run('ROLLBACK').catch(() => {}); throw e; } finally { tg.close(); }
 }
 

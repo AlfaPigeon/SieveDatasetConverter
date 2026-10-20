@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import * as core from './core.js';
+import * as boards from './boards.js';
 import * as schemas from './schemas.js';
 
 const ok = (x) => ({ content: [{ type: 'text', text: core.toJson(x, 2) }] });
@@ -50,6 +51,8 @@ const fetchParams = {
 };
 
 const FIELD_DOC = `Schema JSON: {name, table?, description?, fields:[{name, type: ${schemas.FIELD_TYPES.join('|')}, transform?: ${schemas.TRANSFORMS.join('|')}, required?, max_chars?, max_items?, item_max_chars?, aliases?:[column names for auto-mapping], value? (constant value, or metadata key for transform=metadata; transform=meta marks the default per-row metadata column), option_field? (options field for label_to_option | label_to_distribution | options_dict), label_field? (label_to_distribution without own columns reads this field's source; default: the label_to_option field), label_mode?: auto|text|index|numeric (how a label matches options; auto = text, then numeric value if all options are numbers, else index/letter), ids?: text|index (option ids; default the option text, duplicates get "#2", "#3"), as? (options_dict: list [{id,text}] (default) | object {id:text}; label_to_distribution: object {id:p} (default) | list [{id,p}]; objects are written with keys in option order), allow_empty? / allow_duplicates? (options/shuffle fields: keep rows with empty/whitespace-only items or repeated texts after trim; default false = the row is skipped and refilled), duplicates?: skip (default) | drop (shuffle: remove repeated non-gold items, keep the row) | keep, skip_unknown? (label_to_option: skip rows whose label is not an option), value_from? {column, map?} (any field: the column value through map: exact keys, then "/regex/flags" keys, then "*" = any other value, e.g. {"column": "type", "map": {"click": "true", "/^type|select$/": "input", "*": "false"}}), gold_field? and gold_from? {column, map?} | {argmax_of: [score paths, one per item], ties?: skip (default, row is skipped and replaced) | first} (shuffle), enum?, default?}]}. Options may also be given with explicit ids: [{id, text}] or {id: text}. Transforms: label_to_distribution -> {probabilities} (one-hot from a label, uniform over a multi-label list, soft from a numeric value in auto/numeric mode, or normalised over several numeric columns; sums to 1); a label_to_option field that is empty or not an option gets the distribution's argmax option; options_dict -> ordered [{id, text}]; shuffle -> seeded shuffle of the mapped columns/list; gold = gold_from (column value, optionally mapped to an item index or column name; or the item with the highest argmax_of score) or the first item; its index after shuffling goes to gold_field (or meta.gold_index). Columns id, dataset_id, write_key, source_row, created_at are added automatically.`;
+
+const BOARD_DOC = 'Board JSON: {name, seed? (42), nodes: [{id, type: "source" | "mix" | "target", x?, y?, ...}], edges: [{from, to, ...}]}. source: url (HF name/URL, file path or glob, .duckdb path, dataset_id) or target (a .duckdb output file in the data dir), plus import options (config, split, table, format, limit, fetch, fetch_seed, columns, row_groups, explode, mapping, field_options, metadata). mix: schema ("default"), n (500), seed?, stratify_by? | balance?, distinct_by?, max_per_value?, skip_unknown_labels?, overrides?, field_options?, metadata?, write_key?. target: target (file, default datasets.duckdb), mode (auto | create | append), compact?. Edges source -> mix carry weight (1), where?, mapping?, overrides?, field_options?, metadata? for that source; edges mix -> target say where a mix is written. stratify_by/balance apply within each source.';
 
 export function buildMcpServer() {
   const s = new McpServer({ name: 'sieve-dataset-converter', version: '0.1.0' });
@@ -101,5 +104,14 @@ export function buildMcpServer() {
     { source_target: z.string().describe('.duckdb file to copy from'), table: z.string().optional().describe('table to copy (default: the only one besides datasets)'), target,
       where: z.string().optional().describe('filter on the table columns, e.g. "write_key = \'a\'" or "meta->>\'lang\' = \'en\'"'), n: z.number().int().optional().describe('seeded sample of n rows (default all)'), seed: z.number().int().optional(), compact: z.boolean().optional().describe('then compact the target file') },
     (a) => core.copyRows(a));
+  // boards: a canvas of sources -> mixes -> targets, saved as data/boards/<name>.json
+  const boardRef = { name: z.string().optional().describe('saved board name'), board: z.record(z.string(), z.any()).optional().describe('or an unsaved board object') };
+  tool('save_board', `Save a board (create or overwrite data/boards/<name>.json). ${BOARD_DOC}`, { board: z.record(z.string(), z.any()) }, ({ board }) => boards.saveBoard(board));
+  tool('get_board', 'Get a saved board.', { name: z.string() }, ({ name }) => boards.getBoard(name));
+  tool('list_boards', 'List saved boards with their node counts.', {}, () => boards.listBoards());
+  tool('preview_mix', 'Preview a mix of a board: a combined seeded sample of n rows (default 20, max 500) split over its sources by weight (largest remainder), converted to the mix schema, each row tagged with its source node in _source. Nothing is written. Reports per-source requested/rows/pool_rows.',
+    { ...boardRef, mix: z.string().optional().describe('mix node id (default: the only mix)'), n: z.number().int().optional() }, (a) => boards.previewMix(a));
+  tool('run_board', 'Run a board: every mix connected to a target (or only mix / target) is written with convert_and_write per source, n by weight, one shared write_key per mix (default "<board>-<mix>"); rows of an earlier run under that write_key are replaced, so the same seed gives the same rows. Reports per-source counts.',
+    { ...boardRef, mix: z.string().optional(), target: z.string().optional().describe('target node id') }, (a) => boards.runBoard(a));
   return s;
 }

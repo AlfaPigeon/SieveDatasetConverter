@@ -254,5 +254,40 @@ await core.setMetadata(dD.dataset_id, {}, { field_options: { options: { duplicat
 const cD = (await core.preview(dD.dataset_id, 1)).converted[0];
 assert.equal(cD._skipped, undefined); assert.equal(cD.options.length, 2); assert.equal(cD.options[cD.label], 'x ');
 
+
+// boards: a parquet file, a jsonl file and a duckdb table mixed by weight; preview tags rows; runs are reproducible
+const boards = await import('../src/boards.js');
+assert.deepEqual(boards.splitByWeight(10, [1, 1, 1]), [4, 3, 3]);
+assert.deepEqual(boards.splitByWeight(7, [3, 1]), [5, 2]);
+const bq = path.join(dir, 'bq.parquet'), bdb = path.join(dir, 'bsrc.duckdb'), bj = path.join(dir, 'bj.jsonl');
+{ const i = await DuckDBInstance.create(); const c = await i.connect();
+  await c.run(`COPY (SELECT 'pq ' || x AS question, ['yes', 'no'] AS choices, x % 2 AS answer FROM range(300) t(x)) TO '${bq}' (FORMAT parquet)`);
+  await c.run(`ATTACH '${bdb}' AS b; CREATE TABLE b.items AS SELECT 'db ' || x AS question, ['yes', 'no'] AS choices, 0 AS answer, x % 3 AS grp FROM range(200) t(x); DETACH b`);
+  c.closeSync(); i.closeSync(); }
+fs.writeFileSync(bj, Array.from({ length: 50 }, (_, i) => JSON.stringify({ question: `js ${i}`, choices: ['yes', 'no'], answer: 1 })).join('\n'));
+const board = { name: 'mix-test', seed: 7, nodes: [
+  { id: 'pq', type: 'source', url: bq, limit: 'all' }, { id: 'db', type: 'source', url: bdb, table: 'items', limit: 'all' }, { id: 'js', type: 'source', url: bj, limit: 'all' },
+  { id: 'm', type: 'mix', schema: 'default', n: 60, stratify_by: 'answer' }, { id: 't', type: 'target', target: 'boardout.duckdb' }],
+  edges: [{ from: 'pq', to: 'm', weight: 3 }, { from: 'db', to: 'm', weight: 2, where: 'grp > 0' }, { from: 'js', to: 'm', weight: 1 }, { from: 'm', to: 't' }] };
+assert.throws(() => boards.saveBoard({ ...board, edges: [{ from: 'pq', to: 't' }] }), /only source -> mix and mix -> target/);
+assert.deepEqual(boards.saveBoard(board), { name: 'mix-test', file: 'boards/mix-test.json', nodes: 5, edges: 4 });
+assert.equal(boards.listBoards()[0].sources, 3);
+const si = await boards.sourceInfo({ node: board.nodes[1] });
+assert.equal(si.row_count, 200); assert.ok(si.columns.some((c) => c.name === 'grp' && c.type === 'BIGINT')); assert.equal(si.preview.length, 3);
+const pm = await boards.previewMix({ name: 'mix-test', n: 12 });
+assert.deepEqual(pm.sources.map((x) => [x.source, x.requested, x.rows]), [['pq', 6, 6], ['db', 4, 4], ['js', 2, 2]]);
+assert.ok(pm.rows.every((r) => r.input.startsWith(r._source)));
+assert.equal(pm.sources[1].pool_rows, 133); // where grp > 0
+const pm2 = await boards.previewMix({ name: 'mix-test', n: 12 });
+assert.deepEqual(pm2.rows.map((r) => r.id), pm.rows.map((r) => r.id));
+const rb = await boards.runBoard({ name: 'mix-test' });
+assert.deepEqual(rb.runs[0].sources.map((x) => [x.source, x.rows_written]), [['pq', 30], ['db', 20], ['js', 10]]);
+assert.equal(rb.runs[0].write_key, 'mix-test-m'); assert.equal(rb.runs[0].total_rows_in_target, 60);
+const oq = async (sql) => { const i = await DuckDBInstance.create(path.join(dir, 'boardout.duckdb')); const c = await i.connect(); try { return (await c.runAndReadAll(sql)).getRowObjectsJS(); } finally { c.closeSync(); i.closeSync(); } };
+const snap = async () => (await oq("SELECT meta->>'board_source' s, source_row, input FROM rows ORDER BY 1, 2")).map((x) => `${x.s}:${x.source_row}:${x.input}`);
+const first = await snap();
+const rb2 = await boards.runBoard({ name: 'mix-test' });
+assert.equal(rb2.runs[0].replaced_rows, 60); assert.equal(rb2.runs[0].total_rows_in_target, 60);
+assert.deepEqual(await snap(), first);
 fs.rmSync(dir, { recursive: true, force: true });
 console.log('smoke test passed');

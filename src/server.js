@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import * as core from './core.js';
+import * as boards from './boards.js';
 import * as schemas from './schemas.js';
 import { buildMcpServer } from './mcp.js';
 
@@ -25,6 +26,13 @@ app.post('/api/downloads/cleanup', h((r) => core.cleanupDownloads(r.body?.datase
 app.get('/api/datasets/:id/profile', h((r) => core.profile(r.params.id, { top: r.query.top, where: r.query.where })));
 app.post('/api/copy', h((r) => core.copyRows(r.body)));
 app.post('/api/compact', h((r) => core.compactTarget(r.body?.target)));
+// boards (canvas): saved JSON in data/boards, previews and runs of mixes
+app.get('/api/boards', h(() => boards.listBoards()));
+app.get('/api/boards/:name', h((r) => boards.getBoard(r.params.name)));
+app.post('/api/boards', h((r) => boards.saveBoard(r.body)));
+app.post('/api/boards/source', h((r) => boards.sourceInfo(r.body)));
+app.post('/api/boards/preview', h((r) => boards.previewMix(r.body)));
+app.post('/api/boards/run', h((r) => boards.runBoard(r.body)));
 app.post('/api/datasets/:id/convert', h((r) => core.convertAndWrite(r.params.id, r.body)));
 
 // MCP over streamable HTTP (stateless: fresh server+transport per request; dataset state is shared in-process)

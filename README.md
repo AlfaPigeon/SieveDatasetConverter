@@ -27,6 +27,39 @@ Node 20+, no Docker. Env: `PORT` (3000), `DATA_DIR` (`data`: downloads and `.duc
 **Schemas**: edit or create a schema as JSON from the page.
 ![](docs/screenshots/5-schema-editor.png)
 
+## Canvas (boards)
+`/canvas.html` (linked from the wizard header) is a whiteboard for sampling from many sources at once. It reads left to right: **Source → Mix → Target**, and every setting lives inside its card.
+- **Source** cards are any import: Hugging Face, a Parquet/CSV/JSON/JSONL file or glob, a DuckDB table, or a Sieve output file in the data dir. Each source gets a color and a letter (A, B, C…) that it keeps on its wires, in the mix and in the results. A loaded card shows the row count, the columns with types, the top values of one column and a few sample rows; *Collapse* folds it to one line. Errors (a missing file, no access) show inside the card with *Retry* / *Edit source*.
+- A **Mix** card has the row count, a stacked bar of the shares, one input row per source (relative weight plus a `where` filter), the schema and *Balance by*, and a live 5-row preview tagged by source. If a filter leaves a source with fewer rows than its share, its segment is hatched and its count turns red ("only 120 rows match"). The seed is set in the top bar (↻ rolls a new one) and shown on the mix.
+- Wires take the source's color; thicker means a bigger share, and the label shows the %. The mix → target wire is dashed until the target is written.
+- A **Target** card is a `.duckdb` file with a *New file* / *Append* toggle and the table. *Write* is the one filled button; afterwards the card lists the rows written per source and the total in the target. Any change upstream sets it back to ready (*Write N rows*) and dims the last result.
+
+Drag the background (or hold space / the middle button) to pan, scroll or use the zoom pill at the bottom right (⤢ fits the board), drag cards by their header (shift-click to select several), and drag from an output port to a card to connect it; dropping a wire on empty canvas offers to add the next card there. Double-click the canvas to add a source; Delete removes the selected card or wire. Boards are saved as `data/boards/<name>.json`; `canvas.html?board=<name>` opens one, and boards made through the API or MCP get laid out automatically.
+
+![](docs/screenshots/6-canvas.png)
+
+How a mix is sampled and written:
+- the mix's `n` is split over its sources by weight with the largest-remainder method (1000 over weights 2/1/1 → 500/250/250);
+- each source gets the same seeded sample `convert_and_write` would take (its `where`, then the mix's `stratify_by` / `balance` / `distinct_by`, within that source), converted to the mix schema; `meta` gets `board` and `board_source` (the source card id);
+- writes go through `convert_and_write`, one per source, under one shared `write_key` (default `<board>-<mix>`). Rows of an earlier run under that key are replaced first, so re-running a board with the same seed writes the same rows, also after a restart (sources are re-imported with the same fetch seed). The result lists, per source, `requested`, `rows_written` and `pool_rows`, plus `short_by` when a source runs out.
+
+Board JSON (also for the MCP tools):
+```json
+{ "name": "three-sources", "seed": 42,
+  "nodes": [
+    { "id": "imdb",  "type": "source", "url": "stanfordnlp/imdb", "limit": 2000 },
+    { "id": "local", "type": "source", "url": "/data/local.parquet", "limit": "all" },
+    { "id": "shop",  "type": "source", "target": "shop.duckdb", "table": "reviews", "limit": "all", "mapping": { "input": ["sentence"], "options": ["choices"], "label": ["label"] } },
+    { "id": "mix",   "type": "mix", "schema": "default", "n": 1000 },
+    { "id": "out",   "type": "target", "target": "mixed.duckdb", "mode": "auto" } ],
+  "edges": [
+    { "from": "imdb", "to": "mix", "weight": 2 },
+    { "from": "local", "to": "mix", "weight": 1, "where": "topic < 3" },
+    { "from": "shop", "to": "mix", "weight": 1, "where": "lang = 'en'" },
+    { "from": "mix", "to": "out" } ] }
+```
+Source nodes take the import options (`url` or `target`, `config`, `split`, `table`, `format`, `limit`, `fetch`, `fetch_seed`, `columns`, `row_groups`, `explode`, `mapping`, `field_options`, `metadata`). Mix nodes: `schema`, `n` (500), `seed` (board seed), `stratify_by`, `balance`, `distinct_by`, `max_per_value`, `skip_unknown_labels`, `overrides`, `field_options`, `metadata`, `write_key`. Edges source → mix: `weight` (1), `where`, `mapping`, `overrides`, `field_options`, `metadata` for that source. Cards may carry `x`/`y`, the board a `view`. HTTP: `GET /api/boards`, `GET /api/boards/:name`, `POST /api/boards` (save), `POST /api/boards/source` (`{node, schema}` → card info), `POST /api/boards/preview` and `POST /api/boards/run` (`{name}` or `{board}`, `mix?`, `target?`, `n?`).
+
 ## Sources
 | source | how |
 |---|---|
@@ -119,6 +152,10 @@ Writing the same `dataset_id` and `write_key` again replaces those rows. `create
 | `list_datasets` | – |
 | `profile` | `dataset_id`, `top?` (5), `where?` → for every column: type, nulls, distinct count and top values (text cut at 80 chars) |
 | `copy_rows` | `source_target`, `target`, `table?` (default: the only one besides `datasets`), `where?`, `n?` (seeded sample), `seed?`, `compact?` → copies written rows with their `id`, `source_row`, `meta`, `write_key`, `created_at`, and their `datasets` records (`rows_written` recounted); rows with the same `id` are replaced. Also `POST /api/copy` |
+| `save_board` | `board` (JSON above) → saves `data/boards/<name>.json` |
+| `get_board` / `list_boards` | `name` / – |
+| `preview_mix` | `name` or `board`, `mix?` (default: the only mix), `n?` (20, max 500) → combined sample, rows tagged with `_source`, per-source `requested` / `rows` / `pool_rows`; nothing is written |
+| `run_board` | `name` or `board`, `mix?`, `target?` → writes every mix connected to a target; per-source counts, `write_key`, `replaced_rows` |
 
 Optional params also accept `null` (same as leaving them out; for `target_column`, null disables it).
 

@@ -32,3 +32,4 @@ th{color:var(--mute);font-weight:500;background:#11141a;position:sticky;top:0}tr
 #toast.show{opacity:1;transform:translate(-50%,0)}
 .kv{display:grid;grid-template-columns:1fr 150px 1.4fr var(--h);gap:8px;margin-bottom:8px}.kv button{padding:0;font-size:16px}
 .check input{height:16px;width:16px;accent-color:var(--acc);margin:0}
+.canvaslink{margin-left:auto;color:var(--acc);text-decoration:none;font-size:13px;border:1px solid var(--line);border-radius:9px;padding:6px 12px}.canvaslink:hover{border-color:var(--acc)}
