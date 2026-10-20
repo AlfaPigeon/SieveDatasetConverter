@@ -13,6 +13,9 @@ const mapping = z.record(z.string(), z.union([z.array(z.string()), z.string(), z
 const overrides = z.record(z.string(), z.any()).optional().describe('schema field -> constant value for every row');
 const target = z.string().default('datasets.duckdb').describe('DuckDB file: bare name (inside the data dir) or path');
 const mode = z.enum(['create', 'append']);
+const cleanup = z.boolean().default(false).describe("after a successful write, delete this dataset's downloaded files in data/downloads");
+const limit = z.union([z.number().int(), z.literal('all')]).optional()
+  .describe('max rows to fetch (default 10000; "all" for everything). Hugging Face: reads only the first N rows remotely (DuckDB httpfs range reads, /rows API fallback for <= 1000), so a limit is the first N rows of the split, not a random subset; "all" downloads whole shards');
 
 const FIELD_DOC = `Schema JSON: {name, table?, description?, fields:[{name, type: ${schemas.FIELD_TYPES.join('|')}, transform?: ${schemas.TRANSFORMS.join('|')}, required?, max_chars?, max_items?, item_max_chars?, aliases?:[column names for auto-mapping], value? (constant value, or metadata key for transform=metadata; transform=meta marks the default per-row metadata column), option_field? (for label_to_option), enum?, default?}]}. Columns id, dataset_id, source_row, created_at are added automatically.`;
 
@@ -27,7 +30,7 @@ export function buildMcpServer() {
     wrap(({ dataset }) => core.hfSplits(dataset)));
   s.registerTool('import_dataset', {
     description: 'Download a dataset: Hugging Face name (org/name) or URL, or a CSV/JSON/JSONL/Parquet/DuckDB URL or local path. Returns dataset_id, columns, row count and an auto-suggested mapping for the chosen schema.',
-    inputSchema: { url: z.string(), schema: z.string().default('default'), config: z.string().optional(), split: z.string().optional(), format: z.enum(['csv', 'json', 'jsonl', 'parquet', 'duckdb']).optional(), table: z.string().optional().describe('table to read from a .duckdb source (default: first; see tables in the result)'), limit: z.union([z.number().int(), z.literal('all')]).optional().describe('max rows to fetch (default 10000; "all" for everything). HF shards stop downloading once reached') },
+    inputSchema: { url: z.string(), schema: z.string().default('default'), config: z.string().optional(), split: z.string().optional(), format: z.enum(['csv', 'json', 'jsonl', 'parquet', 'duckdb']).optional(), table: z.string().optional().describe('table to read from a .duckdb source (default: first; see tables in the result)'), limit },
   }, wrap(({ url, ...o }) => core.importDataset(url, o)));
   s.registerTool('preview', {
     description: 'Show raw rows and how they convert with the current schema and mapping.',
@@ -39,13 +42,17 @@ export function buildMcpServer() {
   }, wrap(({ dataset_id, metadata, target_column, schema, table, mapping, overrides }) => core.setMetadata(dataset_id, metadata, { schema, table, mapping, overrides, target_column })));
   s.registerTool('convert_and_write', {
     description: 'Seeded sample of N rows (default 500), convert, and write into the target DuckDB (schema table + datasets metadata table). mode=create makes a new file, mode=append adds to an existing one. Re-writing the same dataset_id replaces its rows.',
-    inputSchema: { dataset_id: z.string(), sample: z.number().int().default(500), target, mode: mode.default('append'), seed: z.number().int().default(42) },
+    inputSchema: { dataset_id: z.string(), sample: z.number().int().default(500), target, mode: mode.default('append'), seed: z.number().int().default(42), cleanup },
   }, wrap(({ dataset_id, ...o }) => core.convertAndWrite(dataset_id, o)));
   s.registerTool('run_pipeline', {
     description: 'One shot: Hugging Face name (+ optional config/split) and schema -> download, auto-map, sample, write. mode defaults to append if the target exists, else create.',
-    inputSchema: { url: z.string(), schema: z.string().default('default'), config: z.string().optional(), split: z.string().optional(), table: z.string().optional(), limit: z.union([z.number().int(), z.literal('all')]).optional().describe('max rows to fetch (default 10000; "all" for everything). HF shards stop downloading once reached'),
-      metadata, target_column, mapping, overrides, sample: z.number().int().default(500), seed: z.number().int().default(42), target, mode: mode.optional() },
+    inputSchema: { url: z.string(), schema: z.string().default('default'), config: z.string().optional(), split: z.string().optional(), table: z.string().optional(), limit,
+      metadata, target_column, mapping, overrides, sample: z.number().int().default(500), seed: z.number().int().default(42), target, mode: mode.optional(), cleanup },
   }, wrap((a) => core.runPipeline(a)));
+  s.registerTool('cleanup_downloads', {
+    description: 'Delete downloaded source files in data/downloads: one dataset_id, or all when omitted. Returns files deleted and bytes freed.',
+    inputSchema: { dataset_id: z.string().optional() },
+  }, wrap(({ dataset_id }) => core.cleanupDownloads(dataset_id)));
   s.registerTool('list_datasets', { description: 'List datasets imported in this process.', inputSchema: {} }, wrap(() => core.listDatasets()));
   return s;
 }

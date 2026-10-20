@@ -21,6 +21,7 @@ app.post('/api/run', h((r) => core.runPipeline(r.body)));
 app.post('/api/import', h((r) => { const { url, ...o } = r.body; return core.importDataset(url, o); }));
 app.get('/api/datasets/:id/preview', h((r) => core.preview(r.params.id, r.query.n)));
 app.post('/api/datasets/:id/metadata', h((r) => { const { schema, table, mapping, overrides, metadata, target_column } = r.body; return core.setMetadata(r.params.id, metadata, { schema, table, mapping, overrides, target_column }); }));
+app.post('/api/downloads/cleanup', h((r) => core.cleanupDownloads(r.body?.dataset_id)));
 app.post('/api/datasets/:id/convert', h((r) => core.convertAndWrite(r.params.id, r.body)));
 
 // MCP over streamable HTTP (stateless: fresh server+transport per request; dataset state is shared in-process)

@@ -66,7 +66,7 @@ $('table').onchange = run('s1', async () => { fill(await api(`/api/datasets/${D.
 // --- step 2: mapping (select per field; chips for multi-column "join" fields) ---
 function fill(d) {
   D = d; steps(true);
-  const src = d.hf ? `${d.hf.config} / ${d.hf.split} · ${d.hf.shards} shards` : d.table ? `table ${d.table}` : d.format;
+  const src = d.hf ? `${d.hf.config} / ${d.hf.split} · ${d.hf.via === 'download' ? `${d.hf.shards} shards` : d.hf.via}${d.download_bytes ? ` · ${(d.download_bytes / 1e6).toFixed(1)} MB` : ''}` : d.table ? `table ${d.table}` : d.format;
   $('info').textContent = $('info').dataset.last = `${d.row_count.toLocaleString()} rows fetched${d.limit ? ` (limit ${d.limit.toLocaleString()})` : ''} · ${src} · ${d.columns.length} columns`;
   if (d.tables) { $('table').innerHTML = d.tables.map((t) => `<option>${esc(t)}</option>`).join(''); $('table').value = d.table; $('table').hidden = false; }
   const cols = d.columns.map((c) => c.name);
@@ -140,11 +140,12 @@ $('writeBtn').onclick = run('s4', async () => {
   await save();
   const isNew = $('target').value === NEW;
   const r = await api(`/api/datasets/${D.dataset_id}/convert`, {
-    sample: +$('n').value, seed: +$('seed').value, target: isNew ? $('newTarget').value : $('target').value, mode: isNew ? 'create' : 'append' });
+    sample: +$('n').value, seed: +$('seed').value, target: isNew ? $('newTarget').value : $('target').value, mode: isNew ? 'create' : 'append', cleanup: $('cleanup').checked });
   $('result').innerHTML = `<div class="card"><h3>${r.mode === 'create' ? 'Created' : 'Appended to'} ${esc(r.target)}</h3><div class="stats">
     <div><span>Rows written</span><b>${r.rows_written.toLocaleString()}</b></div><div><span>Total in target</span><b>${r.total_rows_in_target.toLocaleString()}</b></div>
     <div><span>Schema</span><b>${esc(r.schema)}</b></div><div><span>Table</span><b>${esc(r.table)}</b></div><div><span>Seed</span><b>${r.seed}</b></div></div></div>`;
   toast(`${r.rows_written} rows → ${r.target}`);
+  if (r.cleanup) { steps(false); $('info').textContent = `Downloads deleted (${(r.cleanup.bytes_freed / 1e6).toFixed(1)} MB). Download again to write more.`; }
   await loadTargets(r.target); $('mode').textContent = 'append'; // future writes append
 });
 

@@ -31,3 +31,4 @@ th{color:var(--mute);font-weight:500;background:#11141a;position:sticky;top:0}tr
 #toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);opacity:0;transition:.25s;background:#1d2230;border:1px solid var(--line);padding:9px 16px;border-radius:10px;font-size:13px;pointer-events:none}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 .kv{display:grid;grid-template-columns:1fr 150px 1.4fr var(--h);gap:8px;margin-bottom:8px}.kv button{padding:0;font-size:16px}
+.check input{height:16px;width:16px;accent-color:var(--acc);margin:0}

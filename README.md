@@ -9,7 +9,7 @@ npm run mcp:stdio           # MCP over stdio
 Node 20+, no Docker. Env: `PORT` (3000), `DATA_DIR` (`data`: downloads and `.duckdb` targets), `SCHEMAS_DIR` (`schemas`), `HF_TOKEN` (gated or private HF datasets).
 
 ## Flow
-**1 · Dataset**: type `org/name` and the config/split dropdown fills from the Hugging Face API. You can also paste a file URL or a local path. Choose a schema and how many rows to fetch (default 10,000, or `all`). Hugging Face Parquet shards download one at a time and stop as soon as the limit is reached.
+**1 · Dataset**: type `org/name` and the config/split dropdown fills from the Hugging Face API. You can also paste a file URL or a local path. Choose a schema and how many rows to fetch (default 10,000, or `all`). With a limit, Hugging Face data is read remotely: DuckDB `httpfs` range-reads only the row groups it needs and stops across shards once the limit is reached (1,000 rows of a 41-shard Wikipedia split: ~14 MB instead of a 420 MB shard). Small limits fall back to the datasets-server `/rows` API, and `all` (or a failed remote read) downloads whole shards. A limit takes the **first** N rows of the split, not a random subset; the seeded sample in step 4 is drawn from those rows.
 ![](docs/screenshots/1-dataset.png)
 
 **2 · Mapping**: each schema field gets source columns suggested from its name and `aliases`. `join` fields take several columns, shown as chips.
@@ -18,7 +18,7 @@ Node 20+, no Docker. Env: `PORT` (3000), `DATA_DIR` (`data`: downloads and `.duc
 **3 · Metadata**: a key/value list. Each value is either a constant or copied per row from a source column. Choose the schema column it goes into (default `meta`). The table previews converted rows.
 ![](docs/screenshots/3-metadata.png)
 
-**4 · Sample & write**: a seeded sample (500 rows, seed 42) goes into an existing `.duckdb` file (append) or a new one (create). Files are listed from `DATA_DIR`.
+**4 · Sample & write**: a seeded sample (500 rows, seed 42) goes into an existing `.duckdb` file (append) or a new one (create). Files are listed from `DATA_DIR`. Tick *Delete downloads after write* to remove the dataset's files from `data/downloads` once the write succeeds.
 ![](docs/screenshots/4-write.png)
 
 **Schemas**: edit or create a schema as JSON from the page.
@@ -75,11 +75,12 @@ Writing the same `dataset_id` again replaces its rows. `create` fails if the fil
 | `save_schema` | `schema` (JSON as above; a new `name` creates a schema) |
 | `hf_splits` | `dataset` → configs/splits with row counts |
 | `list_targets` | – → `.duckdb` files in `DATA_DIR` |
-| `import_dataset` | `url`, `schema="default"`, `config?`, `split?`, `table?` (DuckDB source), `format?`, `limit?` (10000 \| n \| `"all"`) |
+| `import_dataset` | `url`, `schema="default"`, `config?`, `split?`, `table?` (DuckDB source), `format?`, `limit?` (10000 \| n \| `"all"`; HF reads only the first n rows remotely). Result has `hf.via` (`httpfs` \| `rows-api` \| `download`) and `download_bytes` |
 | `preview` | `dataset_id`, `n?` |
 | `set_metadata` | `dataset_id`, `metadata?: [{key, value} \| {key, column}]`, `target_column?` (null disables), `schema?`, `table?`, `mapping?: {field: [cols]}`, `overrides?: {field: value}` |
-| `convert_and_write` | `dataset_id`, `sample=500`, `seed=42`, `target="datasets.duckdb"`, `mode="append"` \| `"create"` |
+| `convert_and_write` | `dataset_id`, `sample=500`, `seed=42`, `target="datasets.duckdb"`, `mode="append"` \| `"create"`, `cleanup=false` (delete this dataset's downloads after a successful write) |
 | `run_pipeline` | everything above in one call; `mode` defaults to append if the target exists, else create |
+| `cleanup_downloads` | `dataset_id?` → deletes that dataset's files in `data/downloads` (all when omitted); returns `files_deleted`, `bytes_freed` |
 | `list_datasets` | – |
 
 ```json

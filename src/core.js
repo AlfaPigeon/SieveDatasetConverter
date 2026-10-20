@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
+import os from 'node:os';
+import zlib from 'node:zlib';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DATA_DIR = path.resolve(ROOT, process.env.DATA_DIR || 'data');
@@ -78,23 +80,99 @@ async function download(url, dest, headers = {}) {
   if (!r.ok) throw new Error(`Download failed ${r.status} for ${url}`);
   fs.writeFileSync(dest, Buffer.from(await r.arrayBuffer()));
 }
+const countRows = async (c, f) => Number((await c.runAndReadAll(`SELECT count(*) n FROM read_parquet(${q(f)})`)).getRowObjectsJson()[0].n);
+
+// DuckDB httpfs: lets read_parquet() fetch only the row groups it needs over HTTP range requests.
+// If the extension isn't installed, fetch it ourselves (DuckDB's own installer can hang behind some proxies).
+let httpfsReady;
+function ensureHttpfs(c) {
+  httpfsReady ||= (async () => {
+    try { await c.run('LOAD httpfs'); } catch {
+      const { v, p } = (await c.runAndReadAll('SELECT version() v, (SELECT platform FROM pragma_platform()) p')).getRowObjectsJson()[0];
+      const r = await fetch(`https://extensions.duckdb.org/${v}/${p}/httpfs.duckdb_extension.gz`);
+      if (!r.ok) throw new Error(`httpfs download failed (${r.status})`);
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sieve-ext-')), f = path.join(dir, 'httpfs.duckdb_extension');
+      fs.writeFileSync(f, zlib.gunzipSync(Buffer.from(await r.arrayBuffer())));
+      await c.run(`INSTALL ${q(f)}`); await c.run('LOAD httpfs');
+    }
+    if (process.env.HF_TOKEN) await c.run(`CREATE OR REPLACE SECRET sieve_hf (TYPE http, SCOPE 'https://huggingface.co', EXTRA_HTTP_HEADERS MAP {'Authorization': ${q('Bearer ' + process.env.HF_TOKEN)}})`);
+  })().catch((e) => { httpfsReady = null; throw e; });
+  return httpfsReady;
+}
+// Partial HF fetch: copy only the first `limit` rows of each remote shard into one small local file.
+async function fetchHfRemote(c, urls, limit, id) {
+  await ensureHttpfs(c);
+  const files = []; let have = 0;
+  for (const [i, u] of urls.entries()) {
+    const f = path.join(DL_DIR, `${id}-${i}.parquet`);
+    await c.run(`COPY (SELECT * FROM read_parquet(${q(u)}) LIMIT ${limit - have}) TO ${q(f)} (FORMAT parquet)`);
+    files.push(f); have += await countRows(c, f);
+    if (have >= limit) break;
+  }
+  return files;
+}
+// Small limits: datasets-server /rows API, 100 rows per request.
+async function fetchHfRows(c, repo, hf, limit, id) {
+  const rows = [];
+  for (let off = 0; off < limit; off += 100) {
+    const r = await fetch(`https://datasets-server.huggingface.co/rows?dataset=${encodeURIComponent(repo)}&config=${encodeURIComponent(hf.config)}&split=${encodeURIComponent(hf.split)}&offset=${off}&length=${Math.min(100, limit - off)}`, { headers: hfHeaders() });
+    if (!r.ok) throw new Error(`rows API ${r.status}`);
+    const page = (await r.json()).rows || [];
+    rows.push(...page.map((x) => x.row));
+    if (page.length < 100) break;
+  }
+  if (!rows.length) throw new Error('rows API returned no rows');
+  const tmp = path.join(DL_DIR, `${id}-rows.jsonl`), f = path.join(DL_DIR, `${id}-0.parquet`);
+  fs.writeFileSync(tmp, rows.map((x) => JSON.stringify(x)).join('\n'));
+  try { await c.run(`COPY (SELECT * FROM read_json_auto(${q(tmp)}, format='newline_delimited')) TO ${q(f)} (FORMAT parquet)`); } finally { fs.rmSync(tmp, { force: true }); }
+  return [f];
+}
+// Full shards, one at a time, stopping once `limit` rows are on disk (limit=all, or when remote reads fail).
+async function fetchHfFull(c, urls, limit, id) {
+  const files = []; let have = 0;
+  for (const [i, u] of urls.entries()) {
+    const f = path.join(DL_DIR, `${id}-${i}.parquet`);
+    await download(u, f, hfHeaders()); files.push(f);
+    have += await countRows(c, f);
+    if (limit && have >= limit) break;
+  }
+  return files;
+}
+// Files this process downloaded for a dataset (everything in DL_DIR named "<id>-*" or "<id>.*").
+const ownFiles = (id) => fs.readdirSync(DL_DIR).filter((f) => (id ? f.startsWith(`${id}-`) || f.startsWith(`${id}.`) : true)).map((f) => path.join(DL_DIR, f));
+const bytesOf = (files) => files.reduce((n, f) => n + (fs.existsSync(f) ? fs.statSync(f).size : 0), 0);
+// Delete downloads of one dataset (or all). Datasets that read from them can no longer be previewed/written.
+export async function cleanupDownloads(id) {
+  const files = ownFiles(id), bytes = bytesOf(files);
+  const c = await memConn();
+  for (const st of datasets.values()) {
+    if (!st.src.includes(path.join(DL_DIR, id || ''))) continue; // reads from the deleted files
+    if (st.format === 'duckdb') await c.run(`DETACH DATABASE IF EXISTS src_${st.dataset_id}`).catch(() => {});
+    st.cleaned = true;
+  }
+  for (const f of files) fs.rmSync(f, { force: true });
+  return { dataset_id: id || null, files_deleted: files.length, bytes_freed: bytes };
+}
 
 export async function importDataset(url, opts = {}) {
   url = String(url).trim();
   const id = crypto.randomUUID().slice(0, 8);
   const limit = parseLimit(opts.limit);
-  let format = opts.format || detectFormat(url), hf = null, src, tables = null, table = null, file = null;
+  let format = opts.format || detectFormat(url), hf = null, src, tables = null, table = null, file = null, files = [];
   const repo = fs.existsSync(url) ? null : parseHf(url);
   const c = await memConn();
   if (repo) {
-    // Download shards one by one and stop once we have `limit` rows.
+    // limit: read only the needed rows remotely (httpfs; /rows API for <= 1000); else (or on failure) download whole shards.
     hf = await hfShards(repo, opts); format = 'parquet';
-    const files = []; let have = 0;
-    for (const [i, u] of hf.urls.entries()) {
-      const f = path.join(DL_DIR, `${id}-${i}.parquet`);
-      await download(u, f, hfHeaders()); files.push(f);
-      have += Number((await c.runAndReadAll(`SELECT count(*) n FROM read_parquet(${q(f)})`)).getRowObjectsJson()[0].n);
-      if (limit && have >= limit) break;
+    const tries = limit ? [['httpfs', () => fetchHfRemote(c, hf.urls, limit, id)]] : [];
+    if (limit && limit <= 1000) tries.push(['rows-api', () => fetchHfRows(c, repo, hf, limit, id)]);
+    tries.push(['download', () => fetchHfFull(c, hf.urls, limit, id)]);
+    for (const [via, fn] of tries) {
+      try { files = await fn(); hf.via = via; break; } catch (e) {
+        ownFiles(id).forEach((f) => fs.rmSync(f, { force: true }));
+        hf.errors = [...(hf.errors || []), `${via}: ${String(e.message || e).slice(0, 200)}`];
+        if (via === 'download') throw e;
+      }
     }
     hf.shards = `${files.length}/${hf.urls.length}`; delete hf.urls;
     src = `read_parquet([${files.map(q).join(', ')}])`;
@@ -102,7 +180,7 @@ export async function importDataset(url, opts = {}) {
     if (!format) throw new Error('Cannot detect format; pass format (csv|json|jsonl|parquet|duckdb)');
     if (fs.existsSync(url)) file = path.resolve(url);
     else {
-      file = path.join(DL_DIR, `${id}.${format}`);
+      file = path.join(DL_DIR, `${id}.${format}`); files = [file];
       const u = url.includes('huggingface.co/') ? url.replace('/blob/', '/resolve/') : url;
       await download(u, file, u.includes('huggingface.co/') ? hfHeaders() : {});
     }
@@ -126,7 +204,8 @@ export async function importDataset(url, opts = {}) {
   const name = repo || path.basename(url.split('?')[0]).replace(/\.\w+$/, '');
   const st = {
     dataset_id: id, url, src, limit, tables, table, format, columns: cols, row_count: rowCount,
-    hf: hf && { repo, config: hf.config, split: hf.split, shards: hf.shards },
+    hf: hf && { repo, config: hf.config, split: hf.split, shards: hf.shards, via: hf.via, ...(hf.errors && { fallback_errors: hf.errors }) },
+    files, download_bytes: bytesOf(files),
     metadata: [{ key: 'name', value: name }, { key: 'domain', value: 'general' }, { key: 'source', value: url }],
     meta_column: null,
     schema: null, mapping: {}, overrides: {},
@@ -178,10 +257,11 @@ const metaConst = (st) => Object.fromEntries(st.metadata.filter((e) => !e.column
 function get(id) {
   const st = datasets.get(id);
   if (!st) throw new Error(`Unknown dataset_id ${id}. Call import_dataset first.`);
+  if (st.cleaned) throw new Error(`Downloads of ${id} were cleaned up; import it again.`);
   return st;
 }
 function summary(st) {
-  const { src, ...rest } = st; // never expose local paths
+  const { src, files, ...rest } = st; // never expose local paths
   return { ...rest, schema: rest.schema?.name };
 }
 export function listDatasets() { return [...datasets.values()].map(summary); }
@@ -310,7 +390,7 @@ export function listTargets() {
     return { name: f, bytes: st.size, modified: st.mtime.toISOString() };
   });
 }
-export async function convertAndWrite(id, { sample = 500, target = 'datasets.duckdb', seed = 42, mode = 'append' } = {}) {
+export async function convertAndWrite(id, { sample = 500, target = 'datasets.duckdb', seed = 42, mode = 'append', cleanup = false } = {}) {
   if (!['create', 'append'].includes(mode)) throw new Error('mode must be create or append');
   const exists = fs.existsSync(resolveTarget(target));
   const shown = displayName(resolveTarget(target));
@@ -347,7 +427,8 @@ export async function convertAndWrite(id, { sample = 500, target = 'datasets.duc
       [st.dataset_id, st.schema.name, st.schema.table, metaConst(st).name ?? null, JSON.stringify({ entries: st.metadata, column: st.meta_column }), st.url, st.format, st.row_count, rows.length, seed, JSON.stringify({ mapping: st.mapping, overrides: st.overrides })]);
     await conn.run('COMMIT');
     const total = Number((await conn.runAndReadAll(`SELECT count(*) n FROM ${T}`)).getRowObjectsJson()[0].n);
-    return { mode, dataset_id: st.dataset_id, schema: st.schema.name, table: st.schema.table, target: displayName(tpath), rows_written: rows.length, total_rows_in_target: total, seed };
+    const cleaned = cleanup ? await cleanupDownloads(st.dataset_id) : undefined;
+    return { ...(cleaned && { cleanup: cleaned }), mode, dataset_id: st.dataset_id, schema: st.schema.name, table: st.schema.table, target: displayName(tpath), rows_written: rows.length, total_rows_in_target: total, seed };
   } catch (e) {
     await conn.run('ROLLBACK').catch(() => {});
     throw e;
@@ -357,9 +438,9 @@ export async function convertAndWrite(id, { sample = 500, target = 'datasets.duc
 }
 
 // One shot: HF name/URL + schema -> download, auto-map, sample, write.
-export async function runPipeline({ url, schema = 'default', config, split, format, table, limit, metadata, target_column, mapping, overrides, sample = 500, seed = 42, target, mode }) {
+export async function runPipeline({ url, schema = 'default', config, split, format, table, limit, metadata, target_column, mapping, overrides, sample = 500, seed = 42, target, mode, cleanup }) {
   const imp = await importDataset(url, { schema, config, split, format, table, limit });
   await setMetadata(imp.dataset_id, metadata, { mapping, overrides, target_column });
-  const res = await convertAndWrite(imp.dataset_id, { sample, seed, target, mode: mode || (fs.existsSync(resolveTarget(target)) ? 'append' : 'create') });
-  return { ...res, mapping: datasets.get(imp.dataset_id).mapping };
+  const res = await convertAndWrite(imp.dataset_id, { sample, seed, target, mode: mode || (fs.existsSync(resolveTarget(target)) ? 'append' : 'create'), cleanup });
+  return { ...res, download_bytes: imp.download_bytes, hf: imp.hf, mapping: datasets.get(imp.dataset_id).mapping };
 }
