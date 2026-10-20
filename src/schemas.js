@@ -8,9 +8,9 @@ const DIR = path.resolve(ROOT, process.env.SCHEMAS_DIR || 'schemas');
 fs.mkdirSync(DIR, { recursive: true });
 
 export const FIELD_TYPES = ['text', 'number', 'integer', 'boolean', 'list', 'json'];
-export const TRANSFORMS = ['copy', 'join', 'first', 'constant', 'metadata', 'meta', 'label_to_option'];
+export const TRANSFORMS = ['copy', 'join', 'first', 'constant', 'metadata', 'meta', 'label_to_option', 'label_to_distribution', 'options_dict', 'shuffle'];
 const NAME = /^[a-z][a-z0-9_]{0,62}$/;
-const RESERVED = ['id', 'dataset_id', 'source_row', 'created_at'];
+const RESERVED = ['id', 'dataset_id', 'write_key', 'source_row', 'created_at'];
 
 export function validateSchema(s) {
   if (!s || typeof s !== 'object') throw new Error('schema must be an object');
@@ -29,8 +29,14 @@ export function validateSchema(s) {
     f.transform = f.transform || 'copy';
     if (!FIELD_TYPES.includes(f.type)) throw new Error(`field ${f.name}: type must be one of ${FIELD_TYPES}`);
     if (!TRANSFORMS.includes(f.transform)) throw new Error(`field ${f.name}: transform must be one of ${TRANSFORMS}`);
-    if (f.transform === 'label_to_option' && !s.fields.some((g) => g.name === f.option_field))
+  }
+  for (const f of s.fields) {
+    const has = (n) => s.fields.some((g) => g.name === n);
+    if (['label_to_option', 'label_to_distribution', 'options_dict'].includes(f.transform) && !has(f.option_field))
       throw new Error(`field ${f.name}: option_field "${f.option_field}" not found`);
+    if (f.label_field && !has(f.label_field)) throw new Error(`field ${f.name}: label_field "${f.label_field}" not found`);
+    if (f.gold_field && !has(f.gold_field)) throw new Error(`field ${f.name}: gold_field "${f.gold_field}" not found`);
+    if (f.ids && !['text', 'index'].includes(f.ids)) throw new Error(`field ${f.name}: ids must be text or index`);
   }
   return s;
 }

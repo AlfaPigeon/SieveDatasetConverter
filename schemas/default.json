@@ -1,6 +1,6 @@
 {
   "name": "default",
-  "description": "Decision rows: a text input, optional answer options, a label and/or a numeric score, typed as choice | noul | score. Per-row metadata goes to the JSON column `meta`.",
+  "description": "Decision rows: a text input, optional answer options, a label and/or a numeric score, a target distribution {probabilities} over the options, typed as choice | noul | score. Per-row metadata goes to the JSON column `meta`.",
   "table": "rows",
   "fields": [
     {
@@ -77,6 +77,12 @@
         "stars",
         "confidence"
       ]
+    },
+    {
+      "name": "target",
+      "type": "json",
+      "transform": "label_to_distribution",
+      "option_field": "options"
     },
     {
       "name": "meta",
