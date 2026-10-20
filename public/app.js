@@ -41,7 +41,7 @@ $('url').addEventListener('input', () => {
 });
 $('editBtn').onclick = run('s1', async () => {
   $('editor').hidden = !$('editor').hidden;
-  if (!$('editor').hidden) $('schemaJson').value = JSON.stringify(schema, null, 2);
+  if (!$('editor').hidden) $('schemaJson').value = await SieveUI.schemaJSON(schema.name);
 });
 $('schema').onchange = run('s1', async () => {
   schema = await api('/api/schemas/' + $('schema').value);
@@ -49,7 +49,7 @@ $('schema').onchange = run('s1', async () => {
   if (D) { fill(await api(`/api/datasets/${D.dataset_id}/metadata`, { schema: schema.name })); await preview(); }
 });
 $('saveSchema').onclick = run('s1', async () => {
-  const s = await api('/api/schemas', JSON.parse($('schemaJson').value));
+  const s = await SieveUI.saveSchemaJSON($('schemaJson').value);
   await loadSchemas(s.name); toast(`Schema “${s.name}” saved`);
 });
 $('dl').onclick = run('s1', async () => {
@@ -70,47 +70,17 @@ function fill(d) {
   $('info').textContent = $('info').dataset.last = `${d.row_count.toLocaleString()} rows fetched${d.limit ? ` (limit ${d.limit.toLocaleString()})` : ''} · ${src} · ${d.columns.length} columns`;
   if (d.tables) { $('table').innerHTML = d.tables.map((t) => `<option>${esc(t)}</option>`).join(''); $('table').value = d.table; $('table').hidden = false; }
   const cols = d.columns.map((c) => c.name);
-  const opts = (sel, ph) => `<option value="">${ph}</option>` + cols.filter((c) => !sel.includes(c) || ph === '—').map((c) => `<option ${sel.includes(c) && ph === '—' ? 'selected' : ''}>${esc(c)}</option>`).join('');
-  $('map').innerHTML = Object.entries(d.mapping).map(([f, sel]) => {
-    const def = schema.fields.find((x) => x.name === f) || {};
-    if (def.transform === 'join') return `<label>${esc(f)}<div class="chips" data-f="${esc(f)}">${sel.map((c) => `<span class="chip" data-c="${esc(c)}">${esc(c)}<button type="button" title="Remove">×</button></span>`).join('')}<select>${opts(sel, '+ add column')}</select></div></label>`;
-    return `<label>${esc(f)}<select data-f="${esc(f)}">${opts(sel, '—')}</select></label>`;
-  }).join('');
-  $('meta').innerHTML = d.metadata.map((e) => metaRow(e, cols)).join('');
-  const jf = schema.fields.filter((f) => ['json', 'text'].includes(f.type)).map((f) => f.name);
-  $('metaCol').innerHTML = `<option value="">— not stored per row</option>` + jf.map((f) => `<option ${f === d.meta_column ? 'selected' : ''}>${esc(f)}</option>`).join('');
+  $('map').innerHTML = SieveUI.mappingHTML(schema, cols, d.mapping);
+  $('meta').innerHTML = SieveUI.metaRowsHTML(d.metadata, cols);
+  $('metaCol').innerHTML = SieveUI.metaColOptions(schema, d.meta_column);
 }
-const metaRow = (e, cols) => `<div class="kv"><input class="k" placeholder="key" value="${esc(e.key || '')}">
-  <select class="m"><option value="value">constant</option><option value="column" ${e.column ? 'selected' : ''}>from column</option></select>
-  ${e.column != null ? `<select class="v">${cols.map((c) => `<option ${c === e.column ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>` : `<input class="v" placeholder="value" value="${esc(e.value || '')}">`}
-  <button class="ghost del" title="Remove">×</button></div>`;
-const metadata = () => [...document.querySelectorAll('#meta .kv')].map((r) => {
-  const key = r.querySelector('.k').value, v = r.querySelector('.v').value;
-  return r.querySelector('.m').value === 'column' ? { key, column: v } : { key, value: v };
-}).filter((e) => e.key.trim());
+// mapping and metadata controls are shared with the canvas (sieve-ui.js)
+const metadata = () => SieveUI.readMetadata($('meta'));
 const cols = () => D.columns.map((c) => c.name);
-$('addMeta').onclick = () => $('meta').insertAdjacentHTML('beforeend', metaRow({ key: '', value: '' }, cols()));
-$('meta').addEventListener('click', (e) => { if (e.target.closest('.del')) e.target.closest('.kv').remove(); });
-$('meta').addEventListener('change', (e) => {
-  if (!e.target.classList.contains('m')) return;
-  const row = e.target.closest('.kv'), key = row.querySelector('.k').value;
-  row.outerHTML = metaRow(e.target.value === 'column' ? { key, column: cols()[0] } : { key, value: '' }, cols());
-});
-const mapping = () => {
-  const m = {};
-  document.querySelectorAll('#map select[data-f]').forEach((s) => (m[s.dataset.f] = s.value ? [s.value] : []));
-  document.querySelectorAll('#map .chips').forEach((c) => (m[c.dataset.f] = [...c.querySelectorAll('.chip')].map((x) => x.dataset.c)));
-  return m;
-};
-$('map').addEventListener('click', run('s2', async (e) => {
-  if (!e.target.closest('.chip button')) return;
-  e.target.closest('.chip').remove(); await save(); await preview();
-}));
-$('map').addEventListener('change', run('s2', async (e) => {
-  const chips = e.target.closest('.chips');
-  if (chips) chips.insertAdjacentHTML('afterbegin', `<span class="chip" data-c="${esc(e.target.value)}"></span>`);
-  await save(); await preview();
-}));
+$('addMeta').onclick = () => SieveUI.addMetaRow($('meta'), cols());
+SieveUI.bindMetadata($('meta'), cols);
+const mapping = () => SieveUI.readMapping($('map'));
+SieveUI.bindMapping($('map'), run('s2', async () => { await save(); await preview(); }));
 const save = async () => fill(await api(`/api/datasets/${D.dataset_id}/metadata`, {
   metadata: metadata(), target_column: $('metaCol').value || null, mapping: mapping() }));
 

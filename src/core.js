@@ -15,6 +15,7 @@ const DL_DIR = path.join(DATA_DIR, 'downloads');
 fs.mkdirSync(DL_DIR, { recursive: true });
 
 import { getSchema } from './schemas.js';
+import * as jobs from './jobs.js';
 
 const datasets = new Map(); // dataset_id -> state
 // Memory guards. DuckDB gets a memory limit (SIEVE_DUCKDB_MEMORY, default 25% of RAM) and spills to DATA_DIR/.tmp;
@@ -80,7 +81,7 @@ function hfError(repo, status, msg = '') {
   return e('other', `Hugging Face (${repo}): ${String(msg || `HTTP ${status}`).slice(0, 200)}`);
 }
 async function hfFetch(repo, url) {
-  const r = await fetch(url, { headers: hfHeaders() });
+  const r = await fetch(url, { headers: hfHeaders(), signal: jobs.signal() });
   if (!r.ok) {
     const t = await r.text(); let m = t; try { m = JSON.parse(t).error || t; } catch {}
     throw hfError(repo, r.status, String(m));
@@ -101,7 +102,7 @@ export async function hfSplits(name) {
 // HF auth-check first: a gated repo without access fails here the same way whatever config/split was asked
 // (the datasets-server answers 404 for some and file reads 403 for others).
 async function hfAccess(repo) {
-  let r; try { r = await fetch(`https://huggingface.co/api/datasets/${repo}/auth-check`, { headers: hfHeaders() }); } catch { return false; }
+  let r; try { r = await fetch(`https://huggingface.co/api/datasets/${repo}/auth-check`, { headers: hfHeaders(), signal: jobs.signal() }); } catch (e) { jobs.checkCancel(); return false; }
   if (r.ok) return true;
   const t = await r.text().catch(() => ''); let m = t; try { m = JSON.parse(t).error || t; } catch {}
   if (r.status === 401 || r.status === 403) throw Object.assign(hfError(repo, r.status, String(m)), { access: true, status: r.status });
@@ -158,11 +159,13 @@ async function hfShardsApi(repo, { config, split } = {}) {
 }
 const parseLimit = (l) => (l == null || l === '' ? 10000 : String(l).toLowerCase() === 'all' ? null : Math.max(1, parseInt(l, 10) || 10000));
 const limited = (src, limit) => (limit ? `(SELECT * FROM ${src} LIMIT ${limit})` : src);
-async function download(url, dest, headers = {}) {
-  const r = await fetch(url, { headers, redirect: 'follow' });
+async function download(url, dest, headers = {}, phase = 'Downloading') {
+  const r = await fetch(url, { headers, redirect: 'follow', signal: jobs.signal() });
   if (!r.ok) throw new Error(`Download failed ${r.status} for ${url}`);
-  // streamed to disk (a shard can be GBs)
-  try { await pipeline(Readable.fromWeb(r.body), fs.createWriteStream(dest)); } catch (e) { fs.rmSync(dest, { force: true }); throw e; }
+  // streamed to disk (a shard can be GBs), with byte progress for the job
+  const total = +r.headers.get('content-length') || null; let got = 0;
+  const body = Readable.fromWeb(r.body); body.on('data', (b) => { got += b.length; jobs.report(phase, got, total, 'bytes'); });
+  try { await pipeline(body, fs.createWriteStream(dest)); } catch (e) { fs.rmSync(dest, { force: true }); throw jobs.asCancel(e); }
 }
 const countRows = async (c, f) => Number((await c.runAndReadAll(`SELECT count(*) n FROM read_parquet(${q(f)})`)).getRowObjectsJson()[0].n);
 const ident = (n) => `"${String(n).replace(/"/g, '""')}"`;
@@ -222,6 +225,7 @@ async function fetchHfRemoteInner(c, repo, urls, limit, id, { mode, seed, column
     if (mode === 'head') {
       for (const [i, u] of urls.entries()) {
         const f = path.join(DL_DIR, `${id}-${i}.parquet`);
+        jobs.progress('Fetching rows', have, limit, 'rows');
         await c.run(`COPY (${sel(u, i)} LIMIT ${limit - have}) TO ${q(f)} (FORMAT parquet)`);
         files.push(f); const got = await countRows(c, f); have += got;
         if (info) { let r = 0; for (const g of await groupsOf(u)) { if (r >= got) break; r += g.n; info.data_bytes += g.bytes; } }
@@ -231,7 +235,8 @@ async function fetchHfRemoteInner(c, repo, urls, limit, id, { mode, seed, column
     }
     const shards = seededShuffle(urls.map((u, i) => ({ u, i })), seed).slice(0, 16);
     const groups = [];
-    for (const { u, i } of shards) {
+    for (const [k, { u, i }] of shards.entries()) {
+      jobs.progress('Reading shard metadata', k, shards.length, 'shards');
       let start = 0;
       for (const g of await groupsOf(u)) groups.push({ u, i, start: (start += g.n) - g.n, n: g.n, bytes: g.bytes });
     }
@@ -246,7 +251,9 @@ async function fetchHfRemoteInner(c, repo, urls, limit, id, { mode, seed, column
       take.push({ ...g, size: g.n, n, rows }); have += n;
     }
     if (info) { info.row_groups = take.length; info.data_bytes = take.reduce((a, g) => a + g.bytes, 0); }
-    for (const i of [...new Set(take.map((g) => g.i))].sort((a, b) => a - b)) {
+    const shardIds = [...new Set(take.map((g) => g.i))].sort((a, b) => a - b);
+    for (const [k, i] of shardIds.entries()) {
+      jobs.progress('Fetching row groups', k, shardIds.length, 'shards');
       const parts = take.filter((g) => g.i === i).sort((a, b) => a.start - b.start)
         .map((g) => `(${sel(g.u, i, ` WHERE file_row_number BETWEEN ${g.start} AND ${g.start + g.size - 1}${g.rows ? ` AND file_row_number IN (${g.rows.join(',')})` : ''}`)})`);
       const f = path.join(DL_DIR, `${id}-${i}.parquet`);
@@ -254,12 +261,13 @@ async function fetchHfRemoteInner(c, repo, urls, limit, id, { mode, seed, column
       files.push(f);
     }
     return files;
-  } catch (e) { throw httpError(repo, e); }
+  } catch (e) { throw httpError(repo, jobs.asCancel(e)); }
 }
 // Small limits: datasets-server /rows API, 100 rows per request (first rows).
 async function fetchHfRows(c, repo, hf, limit, id, info = {}) {
   const rows = []; info.rows_api_bytes = 0;
   for (let off = 0; off < limit; off += 100) {
+    jobs.progress('Fetching rows', off, limit, 'rows');
     const j = await hfFetch(repo, `https://datasets-server.huggingface.co/rows?dataset=${encodeURIComponent(repo)}&config=${encodeURIComponent(hf.config)}&split=${encodeURIComponent(hf.split)}&offset=${off}&length=${Math.min(100, limit - off)}`);
     const page = j.rows || []; info.rows_api_bytes += Buffer.byteLength(JSON.stringify(j));
     hf.features ||= Object.fromEntries((j.features || []).map((x) => [x.name, x.type]));
@@ -277,7 +285,8 @@ async function fetchHfFull(c, repo, urls, limit, id) {
   const files = []; let have = 0;
   for (const [i, u] of urls.entries()) {
     const f = path.join(DL_DIR, `${id}-${i}.parquet`);
-    try { await download(u, f, hfHeaders()); } catch (e) { const s = +(String(e.message).match(/\b(401|403)\b/) || [])[1]; throw s ? hfError(repo, s) : e; }
+    jobs.progress(`Downloading shard ${i + 1} of ${urls.length}`);
+    try { await download(u, f, hfHeaders(), `Downloading shard ${i + 1} of ${urls.length}`); } catch (e) { const s = +(String(e.message).match(/\b(401|403)\b/) || [])[1]; throw s ? hfError(repo, s) : e; }
     files.push(f);
     have += await countRows(c, f);
     if (limit && have >= limit) break;
@@ -368,11 +377,21 @@ async function localFiles(c, url) {
     if (!f.length) throw new Error(`No files match ${url}`);
     return f;
   }
-  return fs.existsSync(url) ? [path.resolve(url)] : null;
+  if (fs.existsSync(url)) return [path.resolve(url)];
+  const inData = path.resolve(DATA_DIR, url); // relative to the data dir, e.g. "uploads/file.parquet"
+  if (!path.isAbsolute(url) && inData.startsWith(DATA_DIR + path.sep) && fs.existsSync(inData)) return [inData];
+  if (!/^[a-z][\w+.-]*:\/\//i.test(url) && !parseHf(url) && (detectFormat(url) || /[\\/]/.test(url) || url.startsWith('.')))
+    throw Object.assign(new Error(`File not found: ${path.basename(url)}. Sieve looked for "${url}" on the server${path.isAbsolute(url) ? '' : ' and in its data dir'}; check the path, or upload the file (drop it on the canvas) and use uploads/${path.basename(url)}.`), { kind: 'not_found' });
+  return null;
 }
 const fileList = (files) => (files.length > 1 ? `[${files.map(q).join(', ')}]` : q(files[0]));
 
 export async function importDataset(url, opts = {}) {
+  const c = await memConn();
+  const off = jobs.onCancel(() => { if (jobs.running() <= 1) c.interrupt(); });
+  try { jobs.progress('Opening source'); return await importInner(url, opts); } catch (e) { throw jobs.asCancel(e); } finally { off(); }
+}
+async function importInner(url, opts) {
   url = String(url).trim();
   const id = crypto.randomUUID().slice(0, 8);
   const limit = parseLimit(opts.limit);
@@ -382,6 +401,7 @@ export async function importDataset(url, opts = {}) {
   const repo = local ? null : parseHf(url);
   if (repo) {
     // limit: read only the needed rows remotely (httpfs; /rows API for <= 1000); else (or on failure) download whole shards.
+    jobs.progress('Listing Hugging Face shards');
     hf = await hfShards(repo, opts); format = 'parquet';
     let columns = null;
     // limit "all" with explicit columns: read just those columns of every shard remotely, not whole shards
@@ -402,7 +422,7 @@ export async function importDataset(url, opts = {}) {
       try { files = await fn(); hf.via = via; break; } catch (e) {
         ownFiles(id).forEach((f) => fs.rmSync(f, { force: true }));
         oomHint(e); // a bigger route would not fit either
-        if (e.kind === 'gated' || e.kind === 'memory' || via === 'download') throw e;
+        if (e.kind === 'gated' || e.kind === 'memory' || via === 'download' || jobs.current()?.cancelled) throw jobs.asCancel(e);
         hf.errors = [...(hf.errors || []), `${via}: ${String(e.message || e).slice(0, 200)}`];
       }
     }
@@ -423,7 +443,7 @@ export async function importDataset(url, opts = {}) {
     if (!list) {
       const file = path.join(DL_DIR, `${id}.${format}`); list = files = [file];
       const u = url.includes('huggingface.co/') ? url.replace('/blob/', '/resolve/') : url;
-      await download(u, file, u.includes('huggingface.co/') ? hfHeaders() : {});
+      await download(u, file, u.includes('huggingface.co/') ? hfHeaders() : {}, 'Downloading file');
     }
     src = format === 'parquet' ? `read_parquet(${fileList(list)}, union_by_name=true)` : readerSql(list.length > 1 ? null : list[0], format, fileList(list));
     if (format === 'parquet') {
@@ -451,6 +471,7 @@ export async function importDataset(url, opts = {}) {
     explode = { ...e.explode, batches: e.files.length, file_bytes: bytesOf(e.files) };
     src = `read_parquet([${e.files.map(q).join(', ')}], union_by_name=true)`; cols = await describe(src);
   }
+  jobs.progress('Counting rows');
   const rowCol = cols.some((x) => x.name === ROWCOL);
   cols = cols.filter((x) => x.name !== ROWCOL);
   const rowCount = Number((await c.runAndReadAll(`SELECT count(*) n FROM ${src}`)).getRowObjectsJson()[0].n);
@@ -525,7 +546,8 @@ export async function profile(id, { top = 5, where } = {}) {
   const k = Math.min(Math.max(intOr(top, 5), 0), 50);
   const n = Number((await c.runAndReadAll(`SELECT count(*) n FROM ${from}`)).getRowObjectsJson()[0].n);
   const columns = [];
-  for (const col of st.columns) {
+  for (const [i, col] of st.columns.entries()) {
+    jobs.progress('Profiling columns', i, st.columns.length, 'columns');
     const e = `CAST(${ident(col.name)} AS VARCHAR)`;
     const [a] = (await c.runAndReadAll(`SELECT count(*) FILTER (WHERE ${ident(col.name)} IS NULL)::BIGINT nn, count(DISTINCT ${e})::BIGINT nd FROM ${from}`)).getRowObjectsJson();
     const tv = k ? (await c.runAndReadAll(`SELECT left(${e}, 80) AS "v", count(*)::BIGINT AS "n" FROM ${from} AND ${ident(col.name)} IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT ${k}`)).getRowObjectsJson() : [];
@@ -544,10 +566,29 @@ export function suggestMapping(schema, columnNames) {
     if (hit) { used.add(hit); m[f.name] = [hit]; } else m[f.name] = [];
   }
   if (schema.fields.some((f) => f.required && !m[f.name]?.length)) {
-    const free = columnNames.filter((c) => !used.has(c));
+    const rank = (c) => (/(^|_)(id|key|uuid|hash)$/i.test(c) ? 1 : 0) - (/question|text|prompt|input|stem|sentence|content|query|instruction/i.test(c) ? 1 : 0);
+    const free = columnNames.filter((c) => !used.has(c)).sort((a, b) => rank(a) - rank(b));
     for (const f of schema.fields) if (f.required && !m[f.name]?.length && free.length) m[f.name] = [free.shift()];
   }
   return m;
+}
+// The field that stores per-row metadata (target_column): a json/text field, or null = not stored per row.
+function metaColumnOf(st, name) {
+  if (!name) return null;
+  const f = st.schema.fields.find((x) => x.name === name);
+  if (!f || !['json', 'text'].includes(f.type)) throw new Error(`target_column must be a json/text field of schema ${st.schema.name}`);
+  return name;
+}
+// Re-read a dataset's schema file after it was edited: mappings of fields that still exist are kept, new fields
+// get suggestions.
+export function reloadSchema(id) {
+  const st = get(id), old = st.mapping, oldMeta = st.meta_column;
+  st.schema = getSchema(st.schema.name);
+  const sug = suggestMapping(st.schema, st.columns.map((c) => c.name));
+  st.mapping = Object.fromEntries(Object.keys(sug).map((f) => [f, old[f] ?? sug[f]]));
+  const mf = st.schema.fields.find((f) => f.name === oldMeta && ['json', 'text'].includes(f.type));
+  st.meta_column = mf ? oldMeta : st.schema.fields.find((f) => f.transform === 'meta')?.name || null;
+  return summary(st);
 }
 function useSchema(st, name) {
   st.schema = getSchema(name);
@@ -736,11 +777,7 @@ export async function setMetadata(id, meta = {}, opts = {}) {
   }
   if (Array.isArray(meta)) st.metadata = mergeMeta(st, [], meta);
   else if (meta && Object.keys(meta).length) st.metadata = mergeMeta(st, st.metadata, meta);
-  if (opts.target_column !== undefined) {
-    const f = st.schema.fields.find((x) => x.name === opts.target_column);
-    if (opts.target_column && (!f || !['json', 'text'].includes(f.type))) throw new Error(`target_column must be a json/text field of schema ${st.schema.name}`);
-    st.meta_column = opts.target_column || null;
-  }
+  if (opts.target_column !== undefined) st.meta_column = metaColumnOf(st, opts.target_column);
   if (opts.clear_overrides) st.overrides = {};
   for (const [k, v] of Object.entries(opts.overrides || {})) {
     if (!st.schema.fields.some((f) => f.name === k)) throw new Error(`overrides: schema ${st.schema.name} has no field "${k}"`);
@@ -1052,8 +1089,9 @@ async function writeRows(id, o) {
   const seed = intOr(o.seed, 42);
   const parts = (o.splits?.length ? o.splits : [{ tag: o.write_key || '', n: o.sample }]).map((p) => ({ ...p, key: String(p.tag ?? ''), n: Math.max(1, intOr(p.n, 500)) }));
   if (new Set(parts.map((p) => p.key)).size < parts.length) throw new Error('split tags must be unique');
-  const baseMeta = o.metadata ? mergeMeta(st, st.metadata, o.metadata) : st.metadata;
-  const views = parts.map((p) => ({ ...st, seed, write_key: p.key, metadata: p.metadata ? mergeMeta(st, baseMeta, p.metadata) : baseMeta, overrides: { ...st.overrides, ...o.overrides, ...p.overrides },
+  const baseMeta = o.metadata ? mergeMeta(st, o.replace_metadata ? [] : st.metadata, o.metadata) : st.metadata;
+  const metaCol = o.target_column === undefined ? st.meta_column : metaColumnOf(st, o.target_column);
+  const views = parts.map((p) => ({ ...st, seed, meta_column: metaCol, write_key: p.key, metadata: p.metadata ? mergeMeta(st, baseMeta, p.metadata) : baseMeta, overrides: { ...st.overrides, ...o.overrides, ...p.overrides },
     mapping: { ...st.mapping, ...normMapping(st, o.mapping), ...normMapping(st, p.mapping) },
     field_options: { ...st.field_options, ...normFieldOptions(st, o.field_options), ...normFieldOptions(st, p.field_options) },
     skip_unknown_labels: !!o.skip_unknown_labels }));
@@ -1062,12 +1100,14 @@ async function writeRows(id, o) {
   // check stratify_by / distinct_by / balance before a target file is created
   if (o.stratify_by && o.balance) throw new Error('use stratify_by (a source column) or balance (a schema field), not both');
   const c = await memConn();
+  jobs.progress(dry ? 'Sampling' : 'Preparing write');
   const strat = o.stratify_by ? await pathExpr(c, st, o.stratify_by, 'stratify_by') : o.balance ? await balanceExpr(c, views[0], o.balance) : null;
   const dist = o.distinct_by ? await pathExpr(c, st, o.distinct_by, 'distinct_by') : null;
   const perValue = Math.max(1, intOr(o.max_per_value, 1));
   let P = null; // temp table with the ordered pool
   const tg = dry ? null : await openTarget(target);
   const conn = tg?.conn;
+  const offI = jobs.onCancel(() => { if (jobs.running() <= 1) { c.interrupt(); conn?.interrupt(); } });
   try {
     if (!dry) await prepareTarget(conn, st.schema);
     let excluded = [];
@@ -1110,6 +1150,7 @@ async function writeRows(id, o) {
       while (rows.length < parts[i].n) {
         const r = await nextRow(); if (!r) break;
         if (++seen % 1000 === 0) memoryGuard('write');
+        if (seen % 200 === 1) jobs.progress(dry ? 'Sampling rows' : 'Converting rows', rows.length, parts[i].n, 'rows');
         const { __stratum, __rank, ...src } = r;
         const x = convertRow(src, v);
         if (bad(x)) { sk++; const why = x._skipped || 'missing required field'; reasons[why] = (reasons[why] || 0) + 1; } else { rows.push(x); if (strat) per[__stratum ?? 'null'] = (per[__stratum ?? 'null'] || 0) + 1; }
@@ -1131,12 +1172,13 @@ async function writeRows(id, o) {
     for (const [i, v] of views.entries()) {
       await conn.run(`DELETE FROM ${T} WHERE dataset_id = $1 AND coalesce(write_key, '') = $2`, [st.dataset_id, v.write_key]);
       await conn.run('DELETE FROM datasets WHERE dataset_id = $1 AND table_name = $2 AND write_key = $3', [st.dataset_id, st.schema.table, v.write_key]);
-      for (const r of written[i]) {
+      for (const [k, r] of written[i].entries()) {
+        if (k % 500 === 0) jobs.progress('Writing rows', k, written[i].length, 'rows');
         ins.bind([r.id, r.dataset_id, v.write_key, r.source_row, ...F.map((f) => enc(f, r[f.name]))]);
         await ins.run();
       }
       await conn.run('INSERT INTO datasets (dataset_id,write_key,schema_name,table_name,name,metadata,url,origin,source_key,format,source_rows,rows_written,sample_seed,filter,mapping) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)',
-        [st.dataset_id, v.write_key, st.schema.name, st.schema.table, asText(metaConst(v).name), JSON.stringify({ entries: v.metadata, column: st.meta_column }), st.url, st.origin ? JSON.stringify(st.origin) : null,
+        [st.dataset_id, v.write_key, st.schema.name, st.schema.table, asText(metaConst(v).name), JSON.stringify({ entries: v.metadata, column: v.meta_column }), st.url, st.origin ? JSON.stringify(st.origin) : null,
           st.source_key, st.format, st.row_count, written[i].length, seed, where ? String(where) : null, JSON.stringify({ mapping: v.mapping, overrides: v.overrides, field_options: v.field_options })]);
     }
     await conn.run('COMMIT');
@@ -1153,14 +1195,39 @@ async function writeRows(id, o) {
   } catch (e) {
     await conn?.run('ROLLBACK').catch(() => {});
     if (P) await c.run(`DROP TABLE IF EXISTS ${P}`).catch(() => {});
-    throw oomHint(e);
-  } finally { tg?.close(); }
+    throw jobs.asCancel(oomHint(e));
+  } finally { offI(); tg?.close(); }
 }
 
 let poolSeq = 0;
 
 // compact: rewrite a target file without the space left by deleted/replaced rows. The file is checkpointed, copied
 // table by table into a new file (COPY FROM DATABASE) and swapped in. Also run by compact: true on writes/copies/deletes.
+// Uploads (canvas file drop): saved as DATA_DIR/uploads/<name>; the same file uploaded again (same name and
+// content) is reused, a different one gets "-2", "-3", ... Sources then use "uploads/<name>" (paths are read relative to the data dir too).
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+const UPLOAD_EXT = /\.(parquet|csv|tsv|json|jsonl|ndjson|duckdb|db)$/i;
+export const MAX_UPLOAD_BYTES = (+process.env.SIEVE_MAX_UPLOAD_MB || 4096) * 2 ** 20;
+const fileSha1 = async (f) => { const h = crypto.createHash('sha1'); for await (const b of fs.createReadStream(f)) h.update(b); return h.digest('hex'); };
+export async function saveUpload(name, stream, size) {
+  const base = path.basename(String(name || '')).replace(/[^\w.-]+/g, '_').replace(/^\.+/, '');
+  if (!UPLOAD_EXT.test(base)) throw new Error('Upload a .parquet, .csv, .tsv, .json, .jsonl or .duckdb file');
+  if (size > MAX_UPLOAD_BYTES) throw new Error(`File too large (limit SIEVE_MAX_UPLOAD_MB=${MAX_UPLOAD_BYTES / 2 ** 20})`);
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  const tmp = path.join(UPLOAD_DIR, `.${crypto.randomUUID().slice(0, 8)}.part`);
+  let got = 0; const h = crypto.createHash('sha1');
+  stream.on('data', (b) => { got += b.length; h.update(b); if (got > MAX_UPLOAD_BYTES) stream.destroy(new Error(`File too large (limit SIEVE_MAX_UPLOAD_MB=${MAX_UPLOAD_BYTES / 2 ** 20})`)); });
+  try { await pipeline(stream, fs.createWriteStream(tmp)); } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
+  if (size != null && got !== +size) { fs.rmSync(tmp, { force: true }); throw new Error(`Upload incomplete (${got} of ${size} bytes)`); }
+  const sum = h.digest('hex');
+  const ext = base.match(UPLOAD_EXT)[0], stem = base.slice(0, -ext.length);
+  for (let k = 1; ; k++) {
+    const file = k === 1 ? base : `${stem}-${k}${ext}`, dest = path.join(UPLOAD_DIR, file);
+    if (fs.existsSync(dest) && fs.statSync(dest).size === got && await fileSha1(dest) === sum) { fs.rmSync(tmp); return { name: file, url: `uploads/${file}`, bytes: got, reused: true }; }
+    if (!fs.existsSync(dest)) { fs.renameSync(tmp, dest); return { name: file, url: `uploads/${file}`, bytes: got }; }
+  }
+}
+
 export async function compactTarget(target = 'datasets.duckdb') {
   const p = resolveTarget(target);
   if (!fs.existsSync(p)) throw new Error(`${displayName(p)} does not exist`);
@@ -1291,6 +1358,37 @@ export async function deleteWriteKey(target, table, write_key) {
     await tg.conn.run('COMMIT');
     return { rows_deleted: rows };
   } catch (e) { await tg.conn.run('ROLLBACK').catch(() => {}); throw e; } finally { tg.close(); }
+}
+
+// Row count of a target table (0 when the file or table does not exist).
+export async function targetRows(target, table) {
+  if (!fs.existsSync(resolveTarget(target))) return { total: 0 };
+  const tg = await openTarget(target);
+  try {
+    const has = Number((await tg.conn.runAndReadAll("SELECT count(*) n FROM duckdb_tables() WHERE schema_name = 'main' AND table_name = $1", [table])).getRowObjectsJson()[0].n);
+    return { total: has ? Number((await tg.conn.runAndReadAll(`SELECT count(*) n FROM ${ident(table)}`)).getRowObjectsJson()[0].n) : 0 };
+  } finally { tg.close(); }
+}
+// Move rows written under write_key `from` (a staging key) to `to`, replacing what `to` had: board runs write under a
+// staging key first, so a failed or cancelled run leaves the earlier rows in place. Row ids follow the key
+// (<dataset_id>-<write_key>-<source_row>). The delete is committed before the update (DuckDB checks primary keys eagerly).
+export async function replaceWriteKey(target, table, from, to) {
+  if (!fs.existsSync(resolveTarget(target))) return { rows_deleted: 0, rows_moved: 0 };
+  const tg = await openTarget(target), c = tg.conn, T = ident(table);
+  try {
+    const n = async (sql, p) => Number((await c.runAndReadAll(sql, p)).getRowObjectsJson()[0].n);
+    const deleted = await n(`SELECT count(*) n FROM ${T} WHERE write_key = $1`, [String(to)]);
+    await c.run('BEGIN');
+    await c.run(`DELETE FROM ${T} WHERE write_key = $1`, [String(to)]);
+    await c.run('DELETE FROM datasets WHERE table_name = $1 AND write_key = $2', [table, String(to)]);
+    await c.run('COMMIT');
+    const moved = await n(`SELECT count(*) n FROM ${T} WHERE write_key = $1`, [String(from)]);
+    await c.run('BEGIN');
+    await c.run(`UPDATE ${T} SET write_key = $2, id = dataset_id || '-' || $2 || '-' || CAST(source_row AS VARCHAR) WHERE write_key = $1`, [String(from), String(to)]);
+    await c.run('UPDATE datasets SET write_key = $2 WHERE table_name = $3 AND write_key = $1', [String(from), String(to), table]);
+    await c.run('COMMIT');
+    return { rows_deleted: deleted, rows_moved: moved };
+  } catch (e) { await c.run('ROLLBACK').catch(() => {}); throw e; } finally { tg.close(); }
 }
 
 // One shot: HF name/URL + schema -> download, auto-map, sample, write.

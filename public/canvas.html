@@ -6,7 +6,7 @@
   <b class="brand">Sieve</b>
   <nav class="seg"><a href="index.html">Wizard</a><a class="on" href="canvas.html">Canvas</a></nav>
   <span class="vr"></span>
-  <label class="bname"><input id="bname" spellcheck="false" placeholder="Untitled board"><i data-icon="pencil"></i></label><span id="saved" class="status"></span>
+  <label class="bname"><input id="bname" spellcheck="false" placeholder="Untitled board" title="Board name: click to edit, Enter keeps it, Esc reverts"><i data-icon="pencil"></i></label><span id="saved" class="status"></span><div id="bnameErr" hidden></div>
   <span class="vr"></span>
   <button class="tb" id="addSource"><i data-icon="plus"></i>Source</button><button class="tb" id="addMix"><i data-icon="plus"></i>Mix</button><button class="tb" id="addTarget"><i data-icon="plus"></i>Target</button>
   <span class="grow"></span>
@@ -15,10 +15,34 @@
   <button class="tb" id="saveB"><i data-icon="save"></i>Save</button>
 </header>
 <div id="stage">
-  <div id="world"><svg id="wires"></svg></div>
+  <div id="world"><svg id="wires"></svg><div id="group" hidden></div><div id="marquee" hidden></div>
+    <div id="groupBar" hidden><b></b><span class="vr"></span><button data-g="dup"><i data-icon="copy"></i>Duplicate</button><button data-g="remove" class="bad"><i data-icon="trash"></i>Remove</button></div></div>
   <div id="empty" hidden></div>
   <div id="dropMenu" class="menu" hidden></div>
+  <div id="nodeMenu" class="menu" hidden></div>
+  <div id="dropOv" hidden></div>
+  <aside id="drawer" hidden>
+    <div class="dh" id="dHead"></div>
+    <div id="dMap" class="dpane">
+      <div class="dbody">
+        <div class="dsum" id="dSum"></div>
+        <div id="dFieldsH"></div><div id="dfields" class="mfields"></div>
+        <div id="dset"></div>
+        <div id="dMetaH"></div><div id="dmeta"></div><div id="dmetaMix"></div>
+        <div class="metafoot"><button class="btn ghost sm" id="dAddMeta" data-dact="addmeta"><i data-icon="plus"></i>Add field</button><span class="grow"></span><small>Mix entries apply to all sources; these win.</small></div>
+        <div id="dprev"></div>
+      </div>
+      <div class="dfoot"><button class="btn ghost sm" data-dact="reset"><i data-icon="reroll"></i>Reset to auto</button><span class="grow"></span><small>Changes apply as you edit</small><button class="btn ghost" data-dact="close">Done</button></div>
+    </div>
+    <div id="dSchema" class="dpane" hidden>
+      <div class="dbody"><div id="dSchInfo"></div>
+        <div class="lbl">JSON<span class="grow"></span><span>Save under a new name to create a schema</span></div>
+        <textarea id="schemaJson" spellcheck="false"></textarea><div id="dSchErr" class="badtxt"></div></div>
+      <div class="dfoot"><small id="dSchFoot"></small><span class="grow"></span><button class="btn" data-dact="savesch">Save schema</button></div>
+    </div>
+  </aside>
+  <input type="file" id="filePick" hidden accept=".parquet,.csv,.tsv,.json,.jsonl,.ndjson,.duckdb,.db">
   <div class="zoom"><button id="zOut" title="Zoom out"><i data-icon="minus"></i></button><span id="zPct">100%</span><button id="zIn" title="Zoom in"><i data-icon="plus"></i></button><span class="vr"></span><button id="zFit" title="Fit to screen"><i data-icon="fit"></i></button></div>
 </div>
 <div id="toast"></div>
-<script src="canvas.js"></script></body></html>
+<script src="sieve-ui.js"></script><script src="canvas.js"></script></body></html>

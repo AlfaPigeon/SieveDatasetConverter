@@ -289,5 +289,83 @@ const first = await snap();
 const rb2 = await boards.runBoard({ name: 'mix-test' });
 assert.equal(rb2.runs[0].replaced_rows, 60); assert.equal(rb2.runs[0].total_rows_in_target, 60);
 assert.deepEqual(await snap(), first);
+
+// edges map their own column names to the one mix schema, with metadata entries and target_column, as in the wizard
+const bk = path.join(dir, 'bk.jsonl');
+fs.writeFileSync(bk, Array.from({ length: 40 }, (_, i) => JSON.stringify({ prompt_text: `kq ${i}`, opts: ['red', 'blue'], gold: i % 2, lang: i % 4 ? 'en' : 'de' })).join('\n'));
+const kb = { name: 'map-test', seed: 3, nodes: [
+  { id: 'pq', type: 'source', url: bq, limit: 'all' }, { id: 'k', type: 'source', url: bk, limit: 'all' },
+  { id: 'm', type: 'mix', schema: 'default', n: 20 }, { id: 't', type: 'target', target: 'mapout.duckdb' }],
+  edges: [{ from: 'pq', to: 'm' }, { from: 'k', to: 'm' }, { from: 'm', to: 't' }] };
+let ei = await boards.edgeInfo({ board: kb, source: 'k' });
+assert.deepEqual(ei.columns.map((c) => c.name), ['prompt_text', 'opts', 'gold', 'lang']);
+assert.equal(ei.check.status.options, 'unmapped'); assert.equal(ei.check.status.label, 'unmapped');
+kb.edges[1] = { from: 'k', to: 'm', mapping: { input: ['prompt_text'], options: ['opts'], label: 'gold' },
+  metadata: [{ key: 'domain', value: 'colors' }, { key: 'lang', column: 'lang' }], target_column: 'meta' };
+ei = await boards.edgeInfo({ board: kb, source: 'k', rows: 4 });
+assert.ok(ei.check.ok); assert.equal(ei.check.status.label, 'ok'); assert.deepEqual(ei.mapping.label, ['gold']);
+assert.ok(ei.rows.every((r) => ['red', 'blue'].includes(r.label) && r.domain === 'colors' && ['en', 'de'].includes(r.meta.lang) && r.meta.board_source === 'k' && !('name' in r.meta)));
+const kp = await boards.previewMix({ board: kb, n: 10 });
+assert.ok(kp.sources.every((x) => x.check.ok && x.rows === 5));
+assert.ok(kp.rows.filter((r) => r._source === 'k').every((r) => r.input.startsWith('kq') && r.options[0] === 'red'));
+assert.ok(kp.rows.filter((r) => r._source === 'pq').every((r) => r.input.startsWith('pq') && r.options[0] === 'yes'));
+const kr = await boards.runBoard({ board: kb });
+assert.deepEqual(kr.runs[0].sources.map((x) => x.rows_written), [10, 10]);
+// an unknown column: reported per source in the preview, and the run stops before writing anything
+const kbBad = { ...kb, edges: kb.edges.map((e) => (e.from === 'k' ? { ...e, mapping: { ...e.mapping, label: ['nope'] } } : e)) };
+assert.deepEqual((await boards.edgeInfo({ board: kbBad, source: 'k' })).check.unknown, [{ field: 'label', column: 'nope' }]);
+assert.match((await boards.previewMix({ board: kbBad })).sources[1].error, /unknown column "nope"/);
+await assert.rejects(boards.runBoard({ board: kbBad }), /source k: mapping: label → unknown column "nope"/);
+assert.throws(() => boards.saveBoard({ ...kb, edges: [{ from: 'k', to: 'm', metadata: [{ key: 'x' }] }] }), /metadata entries/);
+// a required field without a column: flagged with a one-click fix, skipped in the preview, and the run refuses
+const kbMiss = { ...kb, edges: kb.edges.map((e) => (e.from === 'k' ? { ...e, mapping: { ...e.mapping, input: [] } } : e)) };
+const em = await boards.edgeInfo({ board: kbMiss, source: 'k' });
+assert.deepEqual(em.check.missing, ['input']); assert.deepEqual(em.check.fixes, { input: 'prompt_text' }); assert.equal(em.check.status.score, 'unmapped');
+const pmm = (await boards.previewMix({ board: kbMiss, n: 10 })).sources[1];
+assert.deepEqual([pmm.rows, pmm.rows_skipped, pmm.skip_reason], [0, 10, 'input not mapped']);
+await assert.rejects(boards.runBoard({ board: kbMiss }), /source k: required input not mapped/);
+// balancing by a field makes it required for every input (here: label), with a fix suggestion
+const kbBal = { ...kb, nodes: kb.nodes.map((n) => (n.id === 'm' ? { ...n, balance: 'label' } : n)), edges: kb.edges.map((e) => (e.from === 'k' ? { ...e, mapping: { ...e.mapping, label: [] } } : e)) };
+const eb = await boards.edgeInfo({ board: kbBal, source: 'k' });
+assert.deepEqual([eb.check.missing, eb.check.status.label], [['label'], 'missing']); assert.ok(eb.check.fixes.label);
+assert.equal((await boards.previewMix({ board: kbBal, n: 10 })).sources[1].skip_reason, 'label not mapped');
+// Store in (target_column) is a mix setting
+assert.equal((await boards.edgeInfo({ board: { ...kb, nodes: kb.nodes.map((n) => (n.id === 'm' ? { ...n, target_column: null } : n)), edges: kb.edges.map((e) => { const { target_column, ...x } = e; return x; }) }, source: 'k' })).rows[0].meta, null);
+// target_column null: metadata is not stored per row
+const kn = await boards.edgeInfo({ board: { ...kb, edges: kb.edges.map((e) => (e.from === 'k' ? { ...e, target_column: null } : e)) }, source: 'k' });
+assert.equal(kn.target_column, null); assert.equal(kn.rows[0].meta, null);
+// an edited schema file is picked up by the cached import; mappings of kept fields stay
+const schemasMod = await import('../src/schemas.js');
+schemasMod.saveSchema({ name: 'mini', table: 'mini', fields: [{ name: 'input', required: true }, { name: 'label' }] });
+const kbm = { ...kb, nodes: kb.nodes.map((n) => (n.id === 'm' ? { ...n, schema: 'mini' } : n)) };
+assert.deepEqual((await boards.edgeInfo({ board: kbm, source: 'k' })).schema.fields.map((f) => f.name), ['input', 'label']);
+schemasMod.saveSchema({ name: 'mini', table: 'mini', fields: [{ name: 'input', required: true }, { name: 'label' }, { name: 'lang', aliases: ['lang'] }] });
+ei = await boards.edgeInfo({ board: kbm, source: 'k' });
+assert.deepEqual(ei.schema.fields.map((f) => f.name), ['input', 'label', 'lang']); assert.deepEqual(ei.mapping.lang, ['lang']); assert.deepEqual(ei.mapping.label, ['gold']);
+
+// cancel: a cancelled run leaves the earlier rows in place and no staging rows behind
+const jobs = await import('../src/jobs.js');
+const before = await snap();
+const j1 = jobs.runJob('c1', () => boards.runBoard({ name: 'mix-test' })); jobs.cancel('c1');
+await assert.rejects(j1, /Cancelled, nothing written/);
+const j2 = jobs.runJob('c2', () => boards.runBoard({ name: 'mix-test' }));
+const poll = setInterval(() => { if (jobs.status('c2').phases.includes('Writing js')) jobs.cancel('c2'); }, 0);
+await assert.rejects(j2, /Cancelled/); clearInterval(poll);
+assert.ok(jobs.status('c2').phases.includes('Writing db'));
+assert.deepEqual(await snap(), before);
+assert.equal((await oq("SELECT count(*)::INT n FROM rows WHERE write_key LIKE '%~%'"))[0].n, 0);
+assert.equal((await boards.runBoard({ name: 'mix-test' })).runs[0].replaced_rows, 60); // still runs after a cancel
+
+// uploads (canvas file drop) land in DATA_DIR/uploads and are read relative to the data dir; missing files are explained
+const { Readable } = await import('node:stream');
+const up = await core.saveUpload('my file.parquet', Readable.from([fs.readFileSync(bq)]), fs.statSync(bq).size);
+assert.deepEqual([up.name, up.url], ['my_file.parquet', 'uploads/my_file.parquet']);
+assert.ok((await core.saveUpload('my file.parquet', Readable.from([fs.readFileSync(bq)]))).reused);
+assert.equal((await core.saveUpload('my file.parquet', Readable.from([Buffer.from('other')]))).name, 'my_file-2.parquet');
+await assert.rejects(core.saveUpload('x.exe', Readable.from([Buffer.from('a')])), /Upload a \.parquet/);
+assert.equal((await core.importDataset('uploads/my_file.parquet', { limit: 'all' })).row_count, 300);
+await assert.rejects(core.importDataset('/nope/missing.parquet'), /File not found: missing\.parquet/);
+await assert.rejects(core.importDataset('data/nope.csv'), /File not found: nope\.csv.*uploads\/nope\.csv/);
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log('smoke test passed');

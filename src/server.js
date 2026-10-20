@@ -5,12 +5,22 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import * as core from './core.js';
 import * as boards from './boards.js';
 import * as schemas from './schemas.js';
+import * as jobs from './jobs.js';
 import { buildMcpServer } from './mcp.js';
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+const json = express.json({ limit: '2mb' });
+app.use((req, res, next) => (req.path === '/api/upload' ? next() : json(req, res, next))); // uploads stream the raw body
 app.use(express.static(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public')));
-const h = (fn) => async (req, res) => { try { res.type('json').send(core.toJson(await fn(req))); } catch (e) { res.status(400).json({ error: String(e.message || e) }); } };
+// Long requests can carry a job id (header x-sieve-job): GET /api/jobs/:id reports progress, POST
+// /api/jobs/:id/cancel stops it. A client that disconnects cancels its job too.
+app.use('/api', (req, res, next) => {
+  const id = req.get('x-sieve-job');
+  if (!id) return next();
+  res.on('close', () => { if (!res.writableFinished) jobs.cancel(id); });
+  try { jobs.runJob(id, () => new Promise((resolve) => { res.on('close', resolve); next(); })); } catch (e) { res.status(400).json({ error: e.message }); }
+});
+const h = (fn) => async (req, res) => { try { res.type('json').send(core.toJson(await fn(req))); } catch (e) { res.status(400).json({ error: String(e.message || e), ...(e.kind && { kind: e.kind }) }); } };
 
 app.get('/api/datasets', h(() => core.listDatasets()));
 app.get('/api/schemas', h(() => schemas.listSchemas()));
@@ -33,6 +43,11 @@ app.post('/api/boards', h((r) => boards.saveBoard(r.body)));
 app.post('/api/boards/source', h((r) => boards.sourceInfo(r.body)));
 app.post('/api/boards/preview', h((r) => boards.previewMix(r.body)));
 app.post('/api/boards/run', h((r) => boards.runBoard(r.body)));
+app.post('/api/boards/edge', h((r) => boards.edgeInfo(r.body)));
+app.get('/api/jobs/:id', h((r) => jobs.status(r.params.id)));
+app.post('/api/jobs/:id/cancel', h((r) => jobs.cancel(r.params.id)));
+// file upload (canvas drop): raw body, ?name=file.parquet -> DATA_DIR/uploads/<name>
+app.post('/api/upload', h((r) => core.saveUpload(r.query.name, r, r.get('content-length'))));
 app.post('/api/datasets/:id/convert', h((r) => core.convertAndWrite(r.params.id, r.body)));
 
 // MCP over streamable HTTP (stateless: fresh server+transport per request; dataset state is shared in-process)
