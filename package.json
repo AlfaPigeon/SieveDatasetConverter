@@ -5,7 +5,8 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "mcp:stdio": "node src/stdio.js"
+    "mcp:stdio": "node src/stdio.js",
+    "test": "node test/smoke.mjs"
   },
   "license": "MIT",
   "dependencies": {
